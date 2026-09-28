@@ -44,6 +44,7 @@ def vec_for_learning(model, tagged_docs):
 
 def training():
     # ---- 1. Load dữ liệu thô (Nazario mbox + SpamAssassin + Enron maildir) --
+    reset_source_stats()
     data = pd.DataFrame()
     data = load_data_phishing(data)
 
@@ -54,7 +55,7 @@ def training():
     data, data_enron = load_data_spamassassin(data, data_enron)
 
     data_enron = load_data_enron(
-        data_enron, BALANCED_MODE, n_phishing=len(data))
+        data_enron, 0)  # Balance only the training subset after dedup/split.
 
     data = pd.concat([data, data_enron], ignore_index=True)
 
@@ -64,15 +65,21 @@ def training():
     # loại bỏ, train_test_split ngẫu nhiên rất dễ chia 2 bản gần-trùng vào
     # cả train lẫn test -- model "nhìn thấy" đáp án test ngay lúc train,
     # điểm test (đặc biệt Accuracy/F1 gần 100%) sẽ KHÔNG đáng tin.
-    before_dedup = len(data)
-    print(f"Khử trùng lặp/gần trùng theo nội dung body trên {before_dedup} email ...")
-    data['_dedup_key'] = data['Text'].apply(compute_dedup_key)
-    data = data.drop_duplicates(subset='_dedup_key', keep='first').drop(columns=['_dedup_key'])
-    data = data.reset_index(drop=True)
-    after_dedup = len(data)
-    removed = before_dedup - after_dedup
-    print(f"  -> Loại {removed} email trùng/gần trùng ({removed/before_dedup*100:.1f}%), "
-          f"còn lại {after_dedup} email.")
+    print("Source counts:", dict(SOURCE_COUNTS))
+    print("Source errors:", dict(SOURCE_ERRORS))
+    if SOURCE_ROW_ISSUES:
+        pd.DataFrame(SOURCE_ROW_ISSUES).to_csv("csv_rows_quarantined.csv", index=False)
+        print(f"Excluded {len(SOURCE_ROW_ISSUES)} malformed/unlabelled CSV records; "
+              "see csv_rows_quarantined.csv. No labels were guessed.")
+    if SOURCE_ERRORS:
+        raise RuntimeError("Dataset has read/label errors; fix the paths/rows listed above before training.")
+    if data.empty:
+        raise ValueError("No labelled emails were loaded from Dataset/")
+    data = deduplicate_emails(data)
+    if data.empty:
+        raise ValueError("No emails remain after duplicate/label-conflict filtering")
+    print("Grouping similar emails before train/test split...", flush=True)
+    data['_group'] = group_email_variants(data)
 
     cnt_pro = data['Class'].value_counts()
     print("Phân bố lớp SAU dedup (0=legit, 1=phishing):\n", cnt_pro)
@@ -101,20 +108,25 @@ def training():
           "social-engineering) trên", len(data), "email ...")
     reset_extraction_stats()
     data['Features'] = data['Text'].apply(extract_engineered_features)
-    stats = get_extraction_stats()
-    if stats["failed"]:
-        pct = stats["failed"] / max(stats["total"], 1) * 100
-        print(f"      -> {stats['failed']}/{stats['total']} email ({pct:.1f}%) "
-              f"bị lỗi khi trích feature, đã fallback về vector 0 cho các email đó.")
-
-    # ---- 3. Làm sạch text (giữ nguyên các bước gốc của repo) --------------
     data['Text'] = data['Text'].apply(cleanText)
     data['Text'] = data['Text'].apply(lambda x: remove_stopwords(x))
-    data['Text'] = data['Text'].apply(lambda x: ' '.join(
-        [WordNetLemmatizer().lemmatize(word, pos=wordnet.VERB) for word in x.split()]))
+    # Lemmatization is optional when WordNet is not installed; no download is needed.
+    lemmatizer = WordNetLemmatizer()
+    try:
+        lemmatizer.lemmatize('running', pos='v')
+    except LookupError:
+        print("WordNet unavailable: using normalized tokens without lemmatization.")
+    else:
+        data['Text'] = data['Text'].apply(
+            lambda text: ' '.join(lemmatizer.lemmatize(w, pos='v') for w in text.split()))
 
-    from sklearn.model_selection import train_test_split
-    train, test = train_test_split(data, test_size=0.3, random_state=42)
+    train, test = split_email_data(data, test_size=0.3, seed=42)
+    if BALANCED_MODE == 1:
+        target = int(train.Class.value_counts().min())
+        train = pd.concat([part.sample(n=target, random_state=42)
+                           for _, part in train.groupby('Class')]).sort_index()
+    print("Train labels:", train.Class.value_counts().to_dict())
+    print("Test labels:", test.Class.value_counts().to_dict())
 
     # ## Training model Doc2Vec (giống bản gốc)
     tqdm.pandas(desc="progress-bar")
@@ -136,7 +148,7 @@ def training():
     y_train, X_train_doc2vec = vec_for_learning(model_dbow, train_tagged)
     y_test, X_test_doc2vec = vec_for_learning(model_dbow, test_tagged)
 
-    # ---- 4. Ghép [Doc2Vec vector | 42 engineered features] ----------------
+    # ---- 4. Ghép [Doc2Vec vector | 40 engineered features] ----------------
     # Chuẩn hoá (StandardScaler) riêng khối engineered features vì thang đo
     # của chúng (vd char_length có thể tới hàng nghìn) rất khác thang của
     # vector Doc2Vec (thường quanh [-1, 1]) -- nếu không chuẩn hoá, các model
