@@ -11,3 +11,4 @@ seaborn
 matplotlib
 tqdm
 requests
+bs4
