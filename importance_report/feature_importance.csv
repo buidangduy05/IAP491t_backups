@@ -1,0 +1,76 @@
+model,rank,feature,importance_pct,kind
+Random Forest,1,num_received_hops,25.190626816753575,engineered
+Random Forest,2,from_display_name_length,19.61492136470289,engineered
+Random Forest,3,is_html,8.03524858328907,engineered
+Random Forest,4,html_to_text_ratio,3.4302676506675724,engineered
+Random Forest,5,doc2vec_dim_85,2.560599564136643,doc2vec
+Random Forest,6,doc2vec_dim_80,2.48233796316409,doc2vec
+Random Forest,7,doc2vec_dim_42,2.1007814255623116,doc2vec
+Random Forest,8,max_url_length,1.9640690497629922,engineered
+Random Forest,9,doc2vec_dim_96,1.5727715545786594,doc2vec
+Random Forest,10,doc2vec_dim_27,1.5446227002317081,doc2vec
+Random Forest,11,avg_url_length,1.5142816934221404,engineered
+Random Forest,12,char_length,1.4698064082383353,engineered
+Random Forest,13,word_count,1.2233024998546789,engineered
+Random Forest,14,num_urls,1.127693080388704,engineered
+Random Forest,15,num_http_urls,1.0885480784993231,engineered
+XGBoost,1,num_received_hops,97.82222747802734,engineered
+XGBoost,2,from_display_name_length,1.3116388320922852,engineered
+XGBoost,3,doc2vec_dim_2,0.4831526279449463,doc2vec
+XGBoost,4,has_date_header,0.23269160091876984,engineered
+XGBoost,5,doc2vec_dim_81,0.08573087304830551,doc2vec
+XGBoost,6,digit_ratio,0.009592759422957897,engineered
+XGBoost,7,char_length,0.009225962683558464,engineered
+XGBoost,8,num_recipients,0.00889579951763153,engineered
+XGBoost,9,doc2vec_dim_91,0.006479988805949688,doc2vec
+XGBoost,10,max_url_length,0.004611987620592117,engineered
+XGBoost,11,doc2vec_dim_80,0.004191500600427389,doc2vec
+XGBoost,12,doc2vec_dim_85,0.0033619096502661705,doc2vec
+XGBoost,13,subject_is_reply_or_fwd,0.0024790451861917973,engineered
+XGBoost,14,doc2vec_dim_17,0.0019449517130851746,doc2vec
+XGBoost,15,doc2vec_dim_87,0.0013960329815745354,doc2vec
+Gradient Boosting,1,num_received_hops,97.75466511177552,engineered
+Gradient Boosting,2,from_display_name_length,1.9718275372370888,engineered
+Gradient Boosting,3,has_date_header,0.27350735087423306,engineered
+Gradient Boosting,4,doc2vec_dim_63,3.692723760674984e-11,doc2vec
+Gradient Boosting,5,doc2vec_dim_84,2.3440725525718645e-11,doc2vec
+Gradient Boosting,6,doc2vec_dim_89,1.2121550124833056e-11,doc2vec
+Gradient Boosting,7,doc2vec_dim_86,1.05401997775723e-11,doc2vec
+Gradient Boosting,8,doc2vec_dim_99,8.406635529486237e-12,doc2vec
+Gradient Boosting,9,doc2vec_dim_38,6.8874616622493024e-12,doc2vec
+Gradient Boosting,10,doc2vec_dim_33,4.798877266645204e-12,doc2vec
+Gradient Boosting,11,doc2vec_dim_53,2.449347437747586e-12,doc2vec
+Gradient Boosting,12,doc2vec_dim_3,1.1703575394251204e-12,doc2vec
+Gradient Boosting,13,doc2vec_dim_31,1.123833679106917e-12,doc2vec
+Gradient Boosting,14,doc2vec_dim_51,1.0961737092499854e-12,doc2vec
+Gradient Boosting,15,doc2vec_dim_76,7.859534477763689e-13,doc2vec
+Decision Tree,1,num_received_hops,97.75466511188853,engineered
+Decision Tree,2,from_display_name_length,1.971827537237193,engineered
+Decision Tree,3,has_date_header,0.2735073508742835,engineered
+Decision Tree,4,brand_keyword_count,0.0,engineered
+Decision Tree,5,reward_scam_keyword_count,0.0,engineered
+Decision Tree,6,generic_greeting,0.0,engineered
+Decision Tree,7,has_archive_attachment,0.0,engineered
+Decision Tree,8,has_macro_attachment,0.0,engineered
+Decision Tree,9,has_executable_attachment,0.0,engineered
+Decision Tree,10,num_attachments,0.0,engineered
+Decision Tree,11,html_to_text_ratio,0.0,engineered
+Decision Tree,12,sensitive_info_keyword_count,0.0,engineered
+Decision Tree,13,urgency_keyword_count,0.0,engineered
+Decision Tree,14,has_double_extension_attachment,0.0,engineered
+Decision Tree,15,has_script_tag,0.0,engineered
+AdaBoost,1,num_received_hops,43.45190343938901,engineered
+AdaBoost,2,from_display_name_length,24.380776338322306,engineered
+AdaBoost,3,has_date_header,18.078291795655062,engineered
+AdaBoost,4,num_recipients,6.49862321974605,engineered
+AdaBoost,5,doc2vec_dim_31,2.5876400704133724,doc2vec
+AdaBoost,6,subject_is_reply_or_fwd,2.5750492473961044,engineered
+AdaBoost,7,doc2vec_dim_12,2.4277158890781005,doc2vec
+AdaBoost,8,has_archive_attachment,0.0,engineered
+AdaBoost,9,reward_scam_keyword_count,0.0,engineered
+AdaBoost,10,generic_greeting,0.0,engineered
+AdaBoost,11,brand_keyword_count,0.0,engineered
+AdaBoost,12,sensitive_info_keyword_count,0.0,engineered
+AdaBoost,13,urgency_keyword_count,0.0,engineered
+AdaBoost,14,has_double_extension_attachment,0.0,engineered
+AdaBoost,15,has_script_tag,0.0,engineered
