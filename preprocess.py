@@ -18,6 +18,13 @@
 from bs4 import BeautifulSoup
 import re
 import hashlib
+import json
+import unicodedata
+import html as html_module
+from email import policy
+from email.header import decode_header
+from functools import lru_cache
+from collections import defaultdict
 from textblob import TextBlob
 import nltk
 from nltk.corpus import wordnet
@@ -34,29 +41,14 @@ from urllib.parse import urlparse
 # --------------------------------------------------------------------------
 
 def cleanText(text):
-    try:
-        text = BeautifulSoup(text, "html.parser").text
-    except Exception:
-        # Một số email phishing thật chứa markup cố tình làm dị dạng (SGML
-        # marked-section kiểu <![if IE]>...<![endif]>, thẻ hỏng...) khiến
-        # bs4/html.parser reject thẳng (ParserRejectedMarkup) thay vì trả
-        # về text như bình thường -- fallback sang regex strip-tag đơn giản
-        # (_strip_html, định nghĩa bên dưới) để không mất cả email đó.
-        text = _strip_html(str(text))
-    # remove all special characters
-    text = re.sub('[^A-Za-z0-9 ]+', r'', text)
-    text = re.sub(r'\|\|\|', r' ', text)
-    # remove http(s) links with <URL>
-    text = re.sub(r'http\S+', r'<URL>', text)
-    # remove unwanted lines starting from special charcters
-    text = re.sub(r'\n: \'\'.*', '', text)
-    text = re.sub(r'\n!.*', '', text)
-    text = re.sub(r'^:\'\'.*', '', text)
-    # remove non-breaking new line characters
-    text = re.sub(r'\n', ' ', text)
-    text = text.lower()
-    text = text.replace('x', '')
-    return text
+    """Use decoded MIME body and subject, preserving Unicode and word boundaries."""
+    msg = _parse_email(text)
+    plain, markup = _get_email_body(msg)
+    body = "\n".join(dict.fromkeys(p for p in (plain, _strip_html(markup)) if p.strip()))
+    text = str(msg.get("Subject", "")) + "\n" + body
+    text = URL_REGEX.sub(" urltoken ", text)
+    text = unicodedata.normalize("NFKC", text).lower()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text)).strip()
 
 
 def spelling_correction(text):
@@ -66,20 +58,11 @@ def spelling_correction(text):
 
 
 def remove_stopwords(text):
-    stop_words = set(stopwords.words('english'))
-    word_tokens = nltk.word_tokenize(text)
-    filtered_sentence = [w for w in word_tokens if not w in stop_words]
-    return ' '.join(filtered_sentence)
+    return ' '.join(w for w in tokenize_text(text) if w not in _english_stopwords())
 
 
 def tokenize_text(text):
-    tokens = []
-    for sent in nltk.sent_tokenize(text):
-        for word in nltk.word_tokenize(sent):
-            if len(word) < 2:
-                continue
-            tokens.append(word.lower())
-    return tokens
+    return [w.lower() for w in re.findall(r"\b\w+\b", str(text)) if len(w) >= 2]
 
 
 # --------------------------------------------------------------------------
@@ -88,13 +71,7 @@ def tokenize_text(text):
 
 URL_REGEX = re.compile(r'(https?://[^\s"\'<>\)\]]+|www\.[^\s"\'<>\)\]]+)', re.IGNORECASE)
 
-# Giới hạn an toàn khi xử lý dữ liệu phishing thật (nội dung độc hại, có thể
-# bị cố tình làm bất thường để "bẻ" parser): cắt bớt text quá dài và giới
-# hạn số URL/anchor xử lý mỗi email, để 1 email dị thường không làm cả batch
-# chạy chậm bất thường (không ảnh hưởng gì tới email bình thường).
-_MAX_TEXT_LEN = 20000
-_MAX_URLS_PER_EMAIL = 200
-_MAX_ANCHORS_PER_EMAIL = 200
+
 
 SHORTENER_DOMAINS = {
     "bit.ly", "tinyurl.com", "goo.gl", "t.co", "ow.ly", "is.gd", "buff.ly",
@@ -151,42 +128,48 @@ REWARD_KEYWORDS = [
 # --------------------------------------------------------------------------
 
 def _safe_decode(part):
-    try:
-        payload = part.get_payload(decode=True)
-        if payload is None:
-            payload_str = part.get_payload()
-            return payload_str if isinstance(payload_str, str) else ""
-        charset = part.get_content_charset() or "utf-8"
-        return payload.decode(charset, errors="replace")
-    except Exception:
-        return ""
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        value = part.get_payload()
+        return value if isinstance(value, str) else ""
+    for charset in (part.get_content_charset(), "utf-8", "windows-1252", "latin-1"):
+        if charset:
+            try:
+                return payload.decode(charset)
+            except (LookupError, UnicodeError):
+                pass
+    return payload.decode("utf-8", errors="replace")
 
 
 def _get_email_body(msg):
-    plain_parts, html_parts = [], []
-    if msg.is_multipart():
-        for part in msg.walk():
-            disp = str(part.get("Content-Disposition") or "")
-            if "attachment" in disp:
-                continue
-            ctype = part.get_content_type()
-            if ctype == "text/plain":
-                plain_parts.append(_safe_decode(part))
-            elif ctype == "text/html":
-                html_parts.append(_safe_decode(part))
-    else:
-        if msg.get_content_type() == "text/html":
-            html_parts.append(_safe_decode(msg))
-        else:
-            plain_parts.append(_safe_decode(msg))
-    return "\n".join(p for p in plain_parts if p), "\n".join(h for h in html_parts if h)
+    plain, markup = [], []
+    def visit(part):
+        if part.get_content_disposition() == "attachment" or part.get_filename():
+            return
+        if part.is_multipart():
+            for child in part.get_payload():
+                visit(child)
+        elif part.get_content_type() in ("text/plain", "text/html"):
+            value = _safe_decode(part)
+            is_html = part.get_content_type() == "text/html" or bool(re.search(r"<\s*(html|body|a|div|p|table|form|img)\b", value, re.I))
+            (markup if is_html else plain).append(value)
+    visit(msg)
+    return "\n".join(plain), "\n".join(markup)
 
 
 def _strip_html(html):
-    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"&nbsp;|&amp;|&lt;|&gt;|&quot;|&#39;", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    if not html:
+        return ""
+    if "<" not in html:
+        return re.sub(r"\s+", " ", html_module.unescape(html)).strip()
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(["script", "style"]):
+            tag.decompose()
+        text = soup.get_text(" ", strip=True)
+    except Exception:
+        text = re.sub(r"<[^>]*>", " ", html)
+    return re.sub(r"\s+", " ", html_module.unescape(text)).strip()
 
 
 # --------------------------------------------------------------------------
@@ -194,9 +177,9 @@ def _strip_html(html):
 # --------------------------------------------------------------------------
 
 def extract_content_stats_features(plain_text, html_text, subject):
-    body_text = plain_text if plain_text.strip() else _strip_html(html_text)
+    body_text = "\n".join(dict.fromkeys(p for p in (plain_text, _strip_html(html_text)) if p.strip()))
     full_text = f"{subject}\n{body_text}"
-    words = re.findall(r"[A-Za-z']+", full_text)
+    words = re.findall(r"\b\w+\b", full_text, re.UNICODE)
     n_words = max(len(words), 1)
     uppercase_words = sum(1 for w in words if len(w) > 2 and w.isupper())
     return {
@@ -229,9 +212,9 @@ def _safe_urlparse(url):
 
 def extract_url_features(plain_text, html_text):
     combined = f"{plain_text}\n{_strip_html(html_text)}\n{html_text}"
-    urls = [u.rstrip('.,);') for u in URL_REGEX.findall(combined)]
+    urls = sorted(set(u.rstrip('.,);') for u in URL_REGEX.findall(combined)))
     total_urls_found = len(urls)
-    urls = urls[:_MAX_URLS_PER_EMAIL]  # tránh email "URL-bombing" làm chậm parser
+    # tránh email "URL-bombing" làm chậm parser
 
     ip_urls = shortened = at_symbol = https_count = http_count = suspicious_tld = 0
     lengths, domains = [], set()
@@ -246,7 +229,7 @@ def extract_url_features(plain_text, html_text):
         elif u.lower().startswith("http://"):
             http_count += 1
         netloc = _safe_urlparse(u if "://" in u else "http://" + u).netloc.lower()
-        host = netloc.split(":")[0]
+        host = (_safe_urlparse(u if "://" in u else "http://" + u).hostname or "").lower()
         if host:
             domains.add(host)
             if ip_pattern.match(host):
@@ -261,8 +244,6 @@ def extract_url_features(plain_text, html_text):
         for i, m in enumerate(re.finditer(
                 r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
                 html_text, flags=re.IGNORECASE | re.DOTALL)):
-            if i >= _MAX_ANCHORS_PER_EMAIL:
-                break
             href, anchor_html = m.group(1), m.group(2)
             anchor_urls = URL_REGEX.findall(_strip_html(anchor_html))
             if anchor_urls:
@@ -357,31 +338,21 @@ def extract_html_features(html_text):
 # --------------------------------------------------------------------------
 
 def extract_attachment_features(msg):
-    num_attachments = has_executable = has_macro = has_archive = has_double_ext = 0
-    if msg.is_multipart():
-        for part in msg.walk():
-            disp = str(part.get("Content-Disposition") or "")
-            filename = part.get_filename()
-            if "attachment" in disp or filename:
-                num_attachments += 1
-                if filename:
-                    fname = filename.lower()
-                    ext_matches = re.findall(r"\.[a-z0-9]+", fname)
-                    if any(fname.endswith(e) for e in EXECUTABLE_EXTENSIONS):
-                        has_executable = 1
-                    if any(fname.endswith(e) for e in MACRO_EXTENSIONS):
-                        has_macro = 1
-                    if any(fname.endswith(e) for e in ARCHIVE_EXTENSIONS):
-                        has_archive = 1
-                    if len(ext_matches) >= 2:
-                        has_double_ext = 1
-    return {
-        "num_attachments": num_attachments,
-        "has_executable_attachment": has_executable,
-        "has_macro_attachment": has_macro,
-        "has_archive_attachment": has_archive,
-        "has_double_extension_attachment": has_double_ext,
-    }
+    count = executable = macro = archive = double_ext = 0
+    for part in msg.walk():
+        filename = part.get_filename()
+        if part.get_content_disposition() == 'attachment' or filename:
+            count += 1
+            if filename:
+                name = filename.lower()
+                is_executable = any(name.endswith(ext) for ext in EXECUTABLE_EXTENSIONS)
+                executable |= int(is_executable)
+                macro |= int(any(name.endswith(ext) for ext in MACRO_EXTENSIONS))
+                archive |= int(any(name.endswith(ext) for ext in ARCHIVE_EXTENSIONS))
+                double_ext |= int(is_executable and len(re.findall(r'\.[a-z0-9]+', name)) >= 2)
+    return {'num_attachments': count, 'has_executable_attachment': executable,
+            'has_macro_attachment': macro, 'has_archive_attachment': archive,
+            'has_double_extension_attachment': double_ext}
 
 
 # --------------------------------------------------------------------------
@@ -390,7 +361,8 @@ def extract_attachment_features(msg):
 
 def extract_social_engineering_features(lowered_text):
     def _count(keywords):
-        return sum(1 for kw in keywords if kw in lowered_text)
+        pattern = r"(?<!\w)(?:" + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True)) + r")(?!\w)"
+        return len(re.findall(pattern, lowered_text, re.I))
     return {
         "urgency_keyword_count": _count(URGENCY_KEYWORDS),
         "sensitive_info_keyword_count": _count(SENSITIVE_INFO_KEYWORDS),
@@ -433,11 +405,7 @@ FEATURE_NAMES = [
     "brand_keyword_count", "generic_greeting", "reward_scam_keyword_count",
 ]
 
-# Bộ đếm để theo dõi có bao nhiêu email bị fallback về vector 0 (lỗi trích
-# xuất) trên tổng số email đã xử lý -- vì except Exception ở dưới im lặng
-# nuốt lỗi (bắt buộc, để 1 email hỏng không sập cả batch train), nếu không
-# đếm lại thì sẽ không biết được tỉ lệ email bị "mất" feature là bao nhiêu.
-# train.py gọi get_extraction_stats() sau khi .apply() xong để in ra.
+# Track extraction failures; errors are raised rather than converted to zero vectors.
 _extraction_stats = {"total": 0, "failed": 0}
 
 
@@ -451,57 +419,21 @@ def reset_extraction_stats():
 
 
 def extract_engineered_features(raw_text):
-    """
-    Nhận vào 1 email RFC-822 THÔ (chưa qua cleanText) dạng str, trả về
-    list[float] đúng thứ tự FEATURE_NAMES -- 42 đặc trưng trên cả 6 nhóm
-    kỹ thuật. Nếu raw_text không parse được như 1 email hợp lệ (vd dữ liệu
-    trong CSV chỉ còn phần content thuần), hàm vẫn không lỗi: các trường
-    header/attachment sẽ về 0, chỉ còn content/social-engineering hoạt động
-    trên toàn bộ text.
-
-    Vì dữ liệu phishing (Nazario) là nội dung ĐỘC HẠI THẬT, có thể có email
-    cố tình chứa HTML/URL bất thường để "bẻ" parser -- plain_text/html_text
-    được CẮT BỚT (xem _MAX_TEXT_LEN) trước khi đưa vào các bước regex nặng
-    (URL, anchor-mismatch) để tránh 1 email dị thường làm cả batch chạy rất
-    chậm; phần bị cắt gần như không ảnh hưởng tới feature vì các đặc điểm
-    phishing (URL, form, script...) thường nằm ngay đầu email.
-    """
+    """Extract all 40 features from the complete MIME-decoded message."""
     _extraction_stats["total"] += 1
     try:
-        msg = email.message_from_string(str(raw_text))
-    except Exception:
-        msg = email.message_from_string("")
-
-    try:
-        subject = msg.get("Subject", "") or ""
-        plain_text, html_text = _get_email_body(msg)
-
-        # Nếu email module không tách được body (vd text đã bị làm sạch từ trước,
-        # không có header) thì coi toàn bộ raw_text là plain_text.
-        if not plain_text and not html_text:
-            plain_text = str(raw_text)
-
-        plain_text = plain_text[:_MAX_TEXT_LEN]
-        html_text = html_text[:_MAX_TEXT_LEN]
-
-        content_feats, lowered = extract_content_stats_features(plain_text, html_text, subject)
-        url_feats = extract_url_features(plain_text, html_text)
-        header_feats = extract_header_features(msg)
-        html_feats = extract_html_features(html_text)
-        attach_feats = extract_attachment_features(msg)
-        social_feats = extract_social_engineering_features(lowered)
-
+        msg = _parse_email(raw_text)
+        plain, markup = _get_email_body(msg)
+        content, lowered = extract_content_stats_features(plain, markup, str(msg.get("Subject", "")))
         merged = {}
-        for d in (content_feats, url_feats, header_feats, html_feats, attach_feats, social_feats):
+        for d in (content, extract_url_features(plain, markup), extract_header_features(msg),
+                  extract_html_features(markup), extract_attachment_features(msg),
+                  extract_social_engineering_features(lowered)):
             merged.update(d)
-
         return [float(merged[name]) for name in FEATURE_NAMES]
     except Exception:
-        # 1 email lỗi bất thường (encoding, cấu trúc hỏng...) không được
-        # phép làm crash cả batch train trên hàng chục nghìn email -- trả
-        # về vector 0, coi như "không trích được đặc trưng" cho email này.
         _extraction_stats["failed"] += 1
-        return [0.0] * len(FEATURE_NAMES)
+        raise  # Do not silently train on a fabricated all-zero vector.
 
 
 # --------------------------------------------------------------------------
@@ -509,36 +441,167 @@ def extract_engineered_features(raw_text):
 # --------------------------------------------------------------------------
 
 def compute_dedup_key(raw_text):
-    """
-    Sinh 1 khoá để phát hiện email TRÙNG LẶP/GẦN TRÙNG -- vấn đề rất phổ
-    biến trong Enron corpus: 1 email được forward cho nhiều người, nằm rải
-    rác ở nhiều mailbox khác nhau (allen-p/, arora-h/...), chỉ khác header
-    (To, Message-ID, Date, X-Folder...) còn nội dung BODY giống hệt hoặc
-    gần hệt nhau.
+    """Routing differences do not matter; HTML links and attachments do."""
+    msg = _parse_email(raw_text)
+    plain, markup = _get_email_body(msg)
+    attachments = []
+    for part in msg.walk():
+        if part.get_content_disposition() == "attachment" or part.get_filename():
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                payload = part.as_bytes()
+            attachments.append((part.get_filename() or "", hashlib.sha256(payload).hexdigest()))
+    content = {"subject": _normalize(str(msg.get("Subject", ""))), "plain": _normalize(plain),
+               "html": markup.strip(), "attachments": sorted(attachments)}
+    if not plain and not markup and not attachments:
+        content["raw"] = raw_text.hex() if isinstance(raw_text, bytes) else str(raw_text)
+    return hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
-    Nếu không xử lý, train_test_split ngẫu nhiên rất dễ chia 2 bản gần-trùng
-    của CÙNG 1 email vào cả train lẫn test -- model coi như đã "nhìn thấy"
-    gần như nguyên văn đáp án của tập test ngay trong lúc train (data
-    leakage), khiến điểm test bị thổi phồng giả tạo, không phản ánh đúng
-    khả năng tổng quát hoá thật của model.
 
-    Cách làm: chỉ lấy phần BODY (bỏ qua header, vì header luôn khác nhau
-    giữa các bản forward), chuẩn hoá khoảng trắng + chữ thường, rồi hash
-    MD5 lại để so sánh nhanh trên tập dữ liệu lớn (500K+ email) mà không
-    cần so khớp string trực tiếp (chậm).
-    """
+def _parse_email(raw):
+    if isinstance(raw, bytes):
+        msg = email.message_from_bytes(raw, policy=policy.compat32)
+    elif isinstance(raw, str):
+        msg = email.message_from_string(raw, policy=policy.compat32)
+    else:
+        raise TypeError("Email must be str or bytes")
+    # Decode display headers without invoking the strict AddressHeader parser.
+    # MIME headers remain untouched so payload/charset decoding stays accurate.
+    for name in ("Subject", "From", "To", "Cc", "Reply-To", "Date"):
+        value = msg.get(name)
+        if value is None:
+            continue
+        value = str(value)
+        try:
+            fragments = decode_header(value)
+        except (ValueError, email.errors.HeaderParseError):
+            fragments = [(value, None)]
+        decoded = []
+        for fragment, charset in fragments:
+            if isinstance(fragment, bytes):
+                for encoding in (charset, "utf-8", "windows-1252", "latin-1"):
+                    if not encoding:
+                        continue
+                    try:
+                        fragment = fragment.decode(encoding)
+                        break
+                    except (LookupError, UnicodeError):
+                        pass
+                if isinstance(fragment, bytes):
+                    fragment = fragment.decode("utf-8", errors="replace")
+            decoded.append(fragment)
+        msg.replace_header(name, "".join(decoded))
+    return msg
+
+
+def _normalize(text):
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text)).strip().lower()
+
+
+@lru_cache(maxsize=1)
+def _english_stopwords():
     try:
-        msg = email.message_from_string(str(raw_text))
-    except Exception:
-        msg = email.message_from_string("")
+        words = set(stopwords.words("english"))
+    except LookupError:
+        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+        words = set(ENGLISH_STOP_WORDS)
+    return words - {"no", "not", "nor", "never"}
 
-    try:
-        plain_text, html_text = _get_email_body(msg)
-        body = plain_text if plain_text.strip() else _strip_html(html_text)
-        if not body.strip():
-            body = str(raw_text)
-    except Exception:
-        body = str(raw_text)
 
-    normalized = re.sub(r'\s+', ' ', body).strip().lower()
-    return hashlib.md5(normalized.encode('utf-8', errors='replace')).hexdigest()
+def deduplicate_emails(data):
+    data = data.dropna(subset=["Text", "Class"]).copy()
+    if not data.Class.isin([0, 1]).all():
+        raise ValueError("Dataset contains labels other than 0/1")
+    data["Class"] = data.Class.astype(int)
+    data["_dedup_key"] = data.Text.apply(compute_dedup_key)
+    conflicts = data.groupby("_dedup_key").Class.nunique()
+    mask = data._dedup_key.isin(set(conflicts[conflicts > 1].index))
+    if mask.any():
+        data.loc[mask, ["Class", "_dedup_key"]].to_csv("label_conflicts.csv", index_label="loaded_row")
+        print(f"Excluded {int(mask.sum())} conflicting-label rows; see label_conflicts.csv")
+    data = data.loc[~mask]
+    before = len(data)
+    data = data.drop_duplicates("_dedup_key").reset_index(drop=True)
+    print(f"Removed {before - len(data)} exact duplicates; {len(data)} emails remain")
+    return data
+
+
+def _simhash(text):
+    text = re.sub(r"\d+", "0", URL_REGEX.sub(" URL ", text))
+    words = re.findall(r"\w+", text)
+    if len(words) < 20:
+        return None
+    votes = [0] * 64
+    for shingle in {" ".join(words[i:i + 3]) for i in range(len(words) - 2)}:
+        value = int.from_bytes(hashlib.blake2b(shingle.encode(), digest_size=8).digest(), "big")
+        for bit in range(64):
+            votes[bit] += 1 if value & (1 << bit) else -1
+    return sum(1 << bit for bit, vote in enumerate(votes) if vote >= 0)
+
+
+def group_email_variants(data):
+    """Keep near duplicates, but put a whole SimHash group in one split.
+
+    Hamming distance <=3 is a heuristic, not semantic equivalence. Four
+    16-bit bands discover all candidate pairs within that distance.
+    """
+    parent = list(range(len(data)))
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    def union(a, b):
+        a, b = root(a), root(b)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+    bodies, hashes, bands = {}, {}, defaultdict(set)
+    for i, (raw, exact) in enumerate(zip(data.Text, data._dedup_key)):
+        msg = _parse_email(raw)
+        plain, markup = _get_email_body(msg)
+        body = _normalize("\n".join(dict.fromkeys(p for p in (plain, _strip_html(markup)) if p.strip())))
+        body_key = hashlib.sha256((body or exact).encode()).hexdigest()
+        if body_key in bodies:
+            union(i, bodies[body_key])
+            continue
+        bodies[body_key] = i
+        fingerprint = _simhash(body)
+        if fingerprint is None:
+            continue
+        if fingerprint in hashes:
+            union(i, hashes[fingerprint])
+            continue
+        keys = [(band, (fingerprint >> (16 * band)) & 65535) for band in range(4)]
+        candidates = set()
+        for key in keys:
+            candidates.update(bands[key])
+        for other in candidates:
+            if bin(fingerprint ^ other).count("1") <= 3:
+                union(i, hashes[other])
+        hashes[fingerprint] = i
+        for key in keys:
+            bands[key].add(fingerprint)
+        if (i + 1) % 5000 == 0:
+            print(f"Grouped {i + 1}/{len(data)} emails", flush=True)
+    return [root(i) for i in range(len(data))]
+
+
+def split_email_data(data, test_size=0.3, seed=42):
+    """Choose a group-disjoint split using only class counts, not model scores."""
+    from sklearn.model_selection import GroupShuffleSplit
+    if data.Class.nunique() != 2 or data._group.nunique() < 2:
+        raise ValueError("Need two classes and independent email groups for train/test")
+    splitter = GroupShuffleSplit(n_splits=32, test_size=test_size, random_state=seed)
+    best = None
+    for train_idx, test_idx in splitter.split(data, data.Class, data._group):
+        train, test = data.iloc[train_idx], data.iloc[test_idx]
+        if train.Class.nunique() != 2 or test.Class.nunique() != 2:
+            continue
+        score = abs(len(test) / len(data) - test_size) + abs(test.Class.mean() - data.Class.mean())
+        if best is None or score < best[0]:
+            best = score, train, test
+    if best is None:
+        raise ValueError("Cannot put both classes in independent train/test groups; more distinct emails are needed")
+    _, train, test = best
+    assert set(train._group).isdisjoint(test._group)
+    return train.copy(), test.copy()
