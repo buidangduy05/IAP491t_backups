@@ -20,6 +20,7 @@
 #     mất URL/HTML/header)
 
 from bs4 import BeautifulSoup
+import os
 import re
 import hashlib
 import json
@@ -46,10 +47,7 @@ from urllib.parse import urlparse
 
 def cleanText(text):
     """Use decoded MIME body and subject, preserving Unicode and word boundaries."""
-    msg = _parse_email(text)
-    plain, markup = _get_email_body(msg)
-    body = "\n".join(dict.fromkeys(p for p in (plain, _strip_html(markup)) if p.strip()))
-    text = _without_template_phrases(_content_subject(msg) + "\n" + body)
+    text = _deobfuscated_message_text(_parse_email(text))[0]
     text = URL_REGEX.sub(" urltoken ", text)
     text = expand_negations(text)
     text = unicodedata.normalize("NFKC", text).lower()
@@ -96,8 +94,16 @@ def _content_subject(msg):
     return "" if _normalize(subject) in SYNTHETIC_TEMPLATE_SUBJECTS else subject
 
 
-def _without_template_phrases(text):
-    return _TEMPLATE_PHRASES.sub(" ", text)
+# Corpus anonymisation placeholder: Phishing Pot replaces every honeypot address with
+# "phishing@pot" (92% of its emails, in greetings, subjects and URLs). Left in, text
+# models learn the literal word "phishing" as the label. Headers and link features keep
+# it: a recipient address inside a URL is a genuine kit signal. No word boundaries: the
+# maintainer's sed often glued it to neighbours ("phishing@potSie", "&#phishing@pot6;").
+_REDACTION_PLACEHOLDERS = re.compile(r"phishing\s*(?:@|%40|&#0*64;|&commat;|\[at\]|\(at\))\s*pot", re.I)
+
+
+def _without_corpus_artifacts(text):
+    return _REDACTION_PLACEHOLDERS.sub(" ", _TEMPLATE_PHRASES.sub(" ", text))
 
 
 SHORTENER_DOMAINS = {
@@ -402,11 +408,18 @@ def extract_url_lexical_features(url):
     return [float(values[name]) for name in URL_LEXICAL_FEATURE_NAMES]
 
 
-def extract_email_urls(raw_text):
-    """URLs as extract_url_features sees them, for scoring with a URL-level model."""
+def extract_email_urls(raw_text, include_qr=False):
+    """URLs as extract_url_features sees them, for scoring with a URL-level model.
+
+    include_qr adds URLs decoded from QR codes, which link-based features never see.
+    """
     msg = _parse_email(raw_text)
     plain, markup = _get_email_body(msg)
-    return _find_urls(plain, markup)
+    urls = _find_urls(plain, markup)
+    if include_qr:
+        urls += sorted({c["payload"].strip() for c in inspect_email_qr_codes(msg)["codes"]
+                        if c["kind"] == "url"} - set(urls))
+    return urls
 
 
 # --------------------------------------------------------------------------
@@ -458,6 +471,9 @@ MESSAGE_SECURITY_FEATURE_NAMES = [
     "hdr_sender_domain_mismatch", "hdr_from_subdomain_depth",
     "mime_signature_count", "mime_unsigned_text_outside_signature", "mime_max_blank_line_run",
     "mime_max_signature_b64_length",
+    # Handbook Ch. 7.3 mismatch triangle and lookalike sender domains.
+    "hdr_reply_to_freemail_divergence", "hdr_display_name_other_address",
+    "hdr_display_name_brand_mismatch", "hdr_sender_brand_lookalike", "hdr_sender_brand_combosquat",
 ]
 # A cid: reference count was measured and dropped: it fired in 15-26% of every
 # EPVME family but ~0% of legitimate mail, because EPVME bodies come from
@@ -530,7 +546,24 @@ def extract_message_security_features(msg):
             blank_run = max(blank_run, longest)
     visit(msg, False)
     signed_present = any(p.get_content_type() == "multipart/signed" for p in msg.walk())
+    display = parseaddr(decoded_froms[0])[0] if decoded_froms else ""
+    shown_address = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", display)
+    reply_domain = _address_domain(parseaddr(str(msg.get("Reply-To", "")))[1])
+    sender_hosts = {d for d in (from_domain, bounce_domain, reply_domain) if d}
+    impersonation = [brand_impersonation(d) for d in sender_hosts]
+    display_brands = _brand_in_text(display)
+    values_identity = {
+        "hdr_reply_to_freemail_divergence": int(reply_domain in FREEMAIL_DOMAINS and bool(from_domain)
+                                                and from_domain not in FREEMAIL_DOMAINS),
+        "hdr_display_name_other_address": int(bool(shown_address) and bool(addresses) and
+                                              shown_address.group(0).lower() != addresses[0].lower()),
+        "hdr_display_name_brand_mismatch": int(bool(display_brands) and bool(from_domain) and
+                                               not any(_is_official_for(b, from_domain) for b in display_brands)),
+        "hdr_sender_brand_lookalike": int(any(v and v[1] == "lookalike" for v in impersonation)),
+        "hdr_sender_brand_combosquat": int(any(v and v[1] == "combosquat" for v in impersonation)),
+    }
     values = {
+        **values_identity,
         "hdr_from_header_count": len(froms),
         "hdr_from_address_count": len(addresses),
         "hdr_from_encoded_address": int(any(
@@ -985,6 +1018,869 @@ def extract_social_engineering_features(lowered_text):
 
 
 # --------------------------------------------------------------------------
+# 7. Text obfuscation: invisible characters, mixed fonts/scripts, hidden HTML
+# --------------------------------------------------------------------------
+
+# Measured on the corpora (2026-10): 6-8% of Nazario 2022-2025 phishing contains
+# invisible characters and up to 8.8% has Cyrillic/Greek letters inside Latin
+# words (passwогd, Bаnk, UРЅ); legitimate corpora are ~0%. That legitimate mail
+# is also older and mostly plain text, so the counts are evidence, not model
+# features. The text models receive the normalized, visible text instead.
+TEXT_OBFUSCATION_FEATURE_NAMES = [
+    "invisible_char_count", "bidi_control_count", "styled_char_count", "mixed_style_word_count",
+    "mixed_script_word_count", "confusable_char_count", "spaced_letter_word_count",
+    "hidden_text_ratio", "font_family_count", "font_switch_count",
+    "intra_word_tag_break_count", "intra_word_font_switch_count",
+    "webfont_rule_count", "embedded_webfont_count",
+]
+_INVISIBLE_CHARS = re.compile("[­͏؜ᅟᅠ឴឵᠋-᠎​-‏"
+                              "‪-‮⁠-⁤⁦-⁯ㅤ︀-️﻿ﾠ]")
+_BIDI_CONTROLS = set("؜‎‏‪‫‬‭‮⁦⁧⁨⁩")
+# "Fonts" that NFKC leaves alone; math bold/italic, fullwidth and circled letters are NFKC-mapped.
+_SMALL_CAPS_CHARS = "ᴀʙᴄᴅᴇғɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡʏᴢ"
+_SMALL_CAPS = str.maketrans(_SMALL_CAPS_CHARS, "abcdefghijklmnopqrstuvwyz")
+# Cyrillic/Greek/Armenian letters that render like Latin ones (subset of Unicode confusables).
+_HOMOGLYPHS = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i", "ј": "j",
+    "ѕ": "s", "ԁ": "d", "һ": "h", "ԛ": "q", "ԝ": "w", "ӏ": "l", "г": "r", "п": "n", "к": "k",
+    "м": "m", "т": "t", "ѵ": "v",
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C",
+    "Т": "T", "Х": "X", "У": "Y", "І": "I", "Ј": "J", "Ѕ": "S", "Ԍ": "G", "Ԛ": "Q", "Ԝ": "W", "Ӏ": "I",
+    "α": "a", "ο": "o", "ν": "v", "κ": "k", "ι": "i", "υ": "u", "γ": "y", "ε": "e", "χ": "x",
+    "ω": "w", "η": "n", "ρ": "p", "τ": "t", "β": "b", "μ": "u", "ϲ": "c", "ϳ": "j",
+    "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N",
+    "Ο": "O", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
+    "օ": "o", "ս": "u", "հ": "h", "ո": "n",
+})
+_CONFUSABLE_SCRIPTS = {"CYRILLIC", "GREEK", "ARMENIAN"}
+# "P a y P a l", "S.E.C.U.R.I.T.Y": one repeated separator between 5+ single letters.
+_SPACED_LETTERS = re.compile(r"\b[A-Za-z](?P<sep>[ .\-_*·])[A-Za-z](?:(?P=sep)[A-Za-z]){3,}\b")
+
+
+def _script(ch):
+    return unicodedata.name(ch, "").split(" ", 1)[0] if ch.isalpha() else None
+
+
+def normalize_obfuscated_text(text):
+    """Undo obfuscation that keeps the rendered look; returns (text, counts).
+
+    Only words that mix Latin with Cyrillic/Greek/Armenian are mapped to Latin,
+    so genuine Cyrillic/Greek text and Vietnamese diacritics stay unchanged.
+    """
+    counts = defaultdict(int)
+    invisible = _INVISIBLE_CHARS.findall(text)
+    counts["invisible_char_count"] = len(invisible)
+    counts["bidi_control_count"] = sum(c in _BIDI_CONTROLS for c in invisible)
+    text = _INVISIBLE_CHARS.sub("", text)
+
+    def word(match):
+        value = match.group(0)
+        styled = sum(c in _SMALL_CAPS_CHARS or unicodedata.normalize("NFKC", c) != c for c in value)
+        if styled:
+            counts["styled_char_count"] += styled
+            counts["mixed_style_word_count"] += styled < len(value)
+            value = unicodedata.normalize("NFKC", value).translate(_SMALL_CAPS)
+        scripts = {_script(c) for c in value} - {None}
+        if "LATIN" in scripts and scripts & _CONFUSABLE_SCRIPTS:
+            counts["mixed_script_word_count"] += 1
+            mapped = value.translate(_HOMOGLYPHS)
+            counts["confusable_char_count"] += sum(a != b for a, b in zip(value, mapped))
+            value = "".join(c for c in unicodedata.normalize("NFKD", mapped) if not unicodedata.combining(c))
+        return value
+
+    text = re.sub(r"[^\W_]+", word, text)
+
+    def join(match):
+        counts["spaced_letter_word_count"] += 1
+        return re.sub(r"[ .\-_*·]", "", match.group(0))
+
+    text = _SPACED_LETTERS.sub(join, text)
+    return unicodedata.normalize("NFKC", text), dict(counts)
+
+
+_BLOCK_TAGS = {"address", "article", "aside", "blockquote", "br", "center", "dd", "div", "dl", "dt",
+               "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
+               "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "table", "tbody",
+               "td", "tfoot", "th", "thead", "tr", "ul"}
+_NON_RENDERED_TAGS = {"script", "style", "head", "title", "template", "noembed", "iframe", "object", "embed"}
+_NAMED_COLORS = {"white": "#ffffff", "black": "#000000", "red": "#ff0000", "blue": "#0000ff",
+                 "green": "#008000", "gray": "#808080", "grey": "#808080", "silver": "#c0c0c0"}
+_LINE_BREAK = object()
+
+
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _style_hides(style):
+    """Inline/CSS declarations that make text invisible in a mail client."""
+    if not style:
+        return False
+    s = str(style).lower()
+    if re.search(r"display\s*:\s*none|visibility\s*:\s*hidden|mso-hide\s*:\s*all", s):
+        return True
+    match = re.search(r"opacity\s*:\s*([\d.]+)", s)
+    if match and (_number(match.group(1)) is not None) and _number(match.group(1)) <= 0.05:
+        return True
+    match = re.search(r"font-size\s*:\s*([\d.]+)\s*(px|pt|em|rem|%)?", s)
+    if match and _number(match.group(1)) is not None:
+        size, unit = _number(match.group(1)), match.group(2) or "px"
+        if size == 0 or (unit in ("px", "pt") and size <= 1) or (unit in ("em", "rem") and size <= 0.1) \
+                or (unit == "%" and size <= 10):
+            return True
+    return bool(re.search(r"overflow\s*:\s*hidden", s) and re.search(
+        r"(?<![-\w])(?:max-)?(?:height|width)\s*:\s*0(?:px|pt|em|%)?\s*(?:;|!|$)", s))
+
+
+def _normalize_color(value):
+    if not value:
+        return None
+    v = str(value).strip().lower().replace(" ", "").split("!")[0]
+    if v in _NAMED_COLORS:
+        return _NAMED_COLORS[v]
+    match = re.fullmatch(r"#?([0-9a-f]{3})", v)
+    if match:
+        return "#" + "".join(c * 2 for c in match.group(1))
+    match = re.fullmatch(r"#?([0-9a-f]{6})", v)
+    if match:
+        return "#" + match.group(1)
+    match = re.fullmatch(r"rgba?\((\d+),(\d+),(\d+)(?:,[\d.]+)?\)", v)
+    if match:
+        return "#%02x%02x%02x" % tuple(min(255, int(x)) for x in match.groups())
+    return None
+
+
+def _css_value(style, prop):
+    match = re.search(r"(?<![-\w])" + prop + r"\s*:\s*([^;]+)", str(style or ""), re.I)
+    return match.group(1).strip() if match else None
+
+
+def _css_color(style, prop):
+    value = _css_value(style, prop)
+    if value is None:
+        return None
+    if prop == "background":
+        return next((c for c in map(_normalize_color, value.split()) if c), None)
+    return _normalize_color(value)
+
+
+def _hidden_css_selectors(markup):
+    """Classes/ids hidden by <style> rules, e.g. the .preheader{display:none} convention."""
+    classes, ids = set(), set()
+    css = " ".join(re.findall(r"<style\b[^>]*>(.*?)</style\s*>", markup, re.I | re.S))
+    for selectors, body in re.findall(r"([^{}@]+)\{([^{}]*)\}", css):
+        if _style_hides(body):
+            for selector in selectors.split(","):
+                selector = selector.strip()
+                match = re.fullmatch(r"[a-z0-9]*\.([\w-]+)", selector, re.I)
+                if match:
+                    classes.add(match.group(1).lower())
+                match = re.fullmatch(r"[a-z0-9]*#([\w-]+)", selector, re.I)
+                if match:
+                    ids.add(match.group(1).lower())
+    return classes, ids
+
+
+def extract_visible_html_text(markup):
+    """Text a mail client would show, and how it was styled.
+
+    Hidden elements are dropped (inline style, hiding <style> classes, text in
+    the background color). Inline tags are joined without inserting spaces, so
+    "Pa<span>ss</span>word" stays one word. Web fonts are reported, not decoded:
+    a custom font can remap glyphs so the stored characters differ from what is
+    displayed, and that cannot be undone without rendering the font.
+    """
+    from bs4.element import Comment, Declaration, Doctype, NavigableString, ProcessingInstruction, Tag
+    stats = {"hidden_text_chars": 0, "visible_text_chars": 0, "font_family_count": 0,
+             "font_switch_count": 0, "intra_word_tag_break_count": 0,
+             "intra_word_font_switch_count": 0, "webfont_rule_count": 0, "embedded_webfont_count": 0}
+    if not markup:
+        return "", stats
+    if "<" not in markup:
+        text = re.sub(r"\s+", " ", html_module.unescape(markup)).strip()
+        stats["visible_text_chars"] = len(text)
+        return text, stats
+    stats["webfont_rule_count"] = len(re.findall(r"@font-face", markup, re.I))
+    stats["embedded_webfont_count"] = len(re.findall(r"url\(\s*['\"]?data:(?:application|font)/", markup, re.I))
+    hidden_classes, hidden_ids = _hidden_css_selectors(markup)
+    try:
+        soup = BeautifulSoup(markup, "html.parser")
+    except Exception:
+        text = _strip_html(markup)
+        stats["visible_text_chars"] = len(text)
+        return text, stats
+    pieces, fonts = [], set()
+    last = {"font": None, "tail": "", "started": False}
+    stack = [(soup, False, None, None, (None, None))]
+    while stack:
+        item = stack.pop()
+        if item is _LINE_BREAK:
+            pieces.append("\n")
+            last["tail"] = "\n"
+            continue
+        node, hidden, color, background, font = item
+        if isinstance(node, (Comment, Declaration, Doctype, ProcessingInstruction)):
+            continue
+        if isinstance(node, NavigableString):
+            text = str(node)
+            if hidden:
+                stats["hidden_text_chars"] += len(text.strip())
+                continue
+            if text.strip():
+                if last["tail"][-1:].isalnum() and text[:1].isalnum():
+                    stats["intra_word_tag_break_count"] += 1
+                    stats["intra_word_font_switch_count"] += font != last["font"]
+                if last["started"] and font != last["font"]:
+                    stats["font_switch_count"] += 1
+                last.update(font=font, tail=text, started=True)
+                fonts.add(font[0])
+                stats["visible_text_chars"] += len(text.strip())
+            else:
+                last["tail"] = " "
+            pieces.append(text)
+            continue
+        if not isinstance(node, Tag):
+            continue
+        name = (node.name or "").lower()
+        if name in _NON_RENDERED_TAGS:
+            continue
+        style = node.get("style", "") or ""
+        classes = {str(c).lower() for c in (node.get("class") or [])}
+        color = (_css_color(style, "color") or
+                 (_normalize_color(node.get("color")) if name == "font" else None) or color)
+        background = (_css_color(style, "background-color") or _css_color(style, "background") or
+                      _normalize_color(node.get("bgcolor")) or background)
+        hidden = (hidden or node.has_attr("hidden") or _style_hides(style) or bool(classes & hidden_classes)
+                  or str(node.get("id", "")).lower() in hidden_ids
+                  or bool(color and background and color == background))
+        family = _css_value(style, "font-family") or (node.get("face") if name == "font" else None)
+        size = _css_value(style, "font-size") or (node.get("size") if name == "font" else None)
+        family = family.split(",")[0].strip(" '\"").lower() if family else font[0]
+        font = (family, str(size).strip().lower() if size else font[1])
+        if name in _BLOCK_TAGS:
+            pieces.append("\n")
+            last["tail"] = "\n"
+            stack.append(_LINE_BREAK)
+        stack.extend((child, hidden, color, background, font) for child in reversed(node.contents))
+    stats["font_family_count"] = len(fonts - {None})
+    text = "".join(pieces)
+    text = re.sub(r"[ \t\r\f\v ]+", " ", text)
+    text = "\n".join(line.strip() for line in text.split("\n"))
+    return re.sub(r"\n{2,}", "\n", text).strip(), stats
+
+
+def _deobfuscated_message_text(msg):
+    """Subject + visible body after deobfuscation, with evidence counts; cached on msg."""
+    if hasattr(msg, "_pipeline_text"):
+        return msg._pipeline_text
+    plain, markup = _get_email_body(msg)
+    visible, html_stats = extract_visible_html_text(markup)
+    subject = _content_subject(msg).strip()
+    bodies = list(dict.fromkeys(s.strip() for s in (plain, visible) if s.strip()))
+    text, counts = normalize_obfuscated_text(
+        _without_corpus_artifacts("\n\n".join(([subject] if subject else []) + bodies)))
+    shown = html_stats["hidden_text_chars"] + html_stats["visible_text_chars"]
+    values = {**counts, **html_stats,
+              "hidden_text_ratio": html_stats["hidden_text_chars"] / shown if shown else 0.0}
+    msg._pipeline_text = (text, {name: float(values.get(name, 0)) for name in TEXT_OBFUSCATION_FEATURE_NAMES})
+    return msg._pipeline_text
+
+
+def extract_text_obfuscation_features(raw_text):
+    return _deobfuscated_message_text(_parse_email(raw_text))[1]
+
+
+# --------------------------------------------------------------------------
+# 8. QR codes (quishing)
+# --------------------------------------------------------------------------
+
+# NOT USED BY THE PIPELINE (2026-10-21): the corpora contain only 2 emails with a
+# decodable QR code, too few to evaluate. Kept as an optional, standalone tool;
+# needs `pip install zxing-cpp` and imports it lazily.
+# QR codes are decoded from MIME images, data: URIs in HTML, images inside
+# Office/ZIP attachments, PDF pages (only when PyMuPDF is installed), and QR
+# codes drawn with HTML table cells or Unicode block characters, which evade
+# image scanners. Nothing is fetched: remote images are counted as unscanned.
+QR_FEATURE_NAMES = [
+    "qr_code_count", "qr_url_count", "qr_non_url_payload_count", "qr_only_link",
+    "qr_url_sender_domain_mismatch", "qr_url_not_in_email_links", "qr_url_risky_host_count",
+    "qr_url_sensitive_word_count", "qr_in_attachment_count", "qr_rendered_from_markup_count",
+    "qr_unscanned_image_count",
+]
+QR_MAX_IMAGES = 24
+QR_MAX_PIXELS = 25_000_000
+QR_MAX_PDF_PAGES = 3
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+_QR_KINDS = ((r"^(?:https?|ftp)://|^www\.", "url"), (r"^mailto:", "email"), (r"^(?:tel|sms|smsto|mms):", "phone"),
+             (r"^WIFI:", "wifi"), (r"^BEGIN:VCARD", "contact"), (r"^MECARD:", "contact"),
+             (r"^(?:bitcoin|ethereum|litecoin|monero):", "crypto"), (r"^otpauth://", "otp"))
+_HALF_BLOCKS = {"█": (1, 1), "▀": (1, 0), "▄": (0, 1), "■": (1, 1), "▓": (1, 1), " ": (0, 0), " ": (0, 0)}
+
+
+def _read_qr(image):
+    """zxing-cpp on a grayscale PIL image; tiny images are also tried upscaled."""
+    from PIL import Image
+    import zxingcpp
+    def read(img):
+        return [r.text for r in zxingcpp.read_barcodes(img, formats=zxingcpp.BarcodeFormat.QRCode)
+                if r.valid and r.text]
+    texts = read(image)
+    if not texts and min(image.size) < 300:
+        texts = read(image.resize((image.width * 4, image.height * 4), Image.NEAREST))
+    return texts
+
+
+def _decode_qr_image(data):
+    import io
+    from PIL import Image
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.width * image.height > QR_MAX_PIXELS:
+                return [], "image_pixel_limit"
+            texts = []
+            for index in range(min(getattr(image, "n_frames", 1), 3)):
+                image.seek(index)
+                # Composite transparency on white: a dark-on-transparent QR is otherwise all dark.
+                rgba = image.convert("RGBA")
+                gray = Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba).convert("L")
+                texts.extend(t for t in _read_qr(gray) if t not in texts)
+            return texts, None
+    except Image.DecompressionBombError:
+        return [], "image_pixel_limit"
+    except Exception:
+        return [], "image_unreadable"
+
+
+def _grid_to_image(grid):
+    """0/1 module grid (1 = dark) -> scaled grayscale image with a quiet zone."""
+    import numpy as np
+    from PIL import Image
+    modules = np.pad(np.asarray(grid, dtype=np.uint8), 4)
+    pixels = np.kron(255 - modules * 255, np.ones((6, 6), dtype=np.uint8)).astype(np.uint8)
+    return Image.fromarray(pixels, mode="L")
+
+
+def _html_table_qr_images(markup):
+    """QR codes drawn as table cells with dark/light background colors."""
+    if len(re.findall(r"<tr\b", markup, re.I)) < 21:
+        return []
+    try:
+        soup = BeautifulSoup(markup, "html.parser")
+    except Exception:
+        return []
+    images = []
+    for table in soup.find_all("table")[:20]:
+        rows = [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
+        if not 21 <= len(rows) <= 200:
+            continue
+        grid, colors = [], set()
+        for tr in rows:
+            row = []
+            for cell in (c for c in tr.find_all(["td", "th"]) if c.find_parent("tr") is tr):
+                color = (_css_color(cell.get("style"), "background-color") or _css_color(cell.get("style"), "background")
+                         or _normalize_color(cell.get("bgcolor")) or "#ffffff")
+                colors.add(color)
+                r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+                span = int(_number(cell.get("colspan")) or 1)
+                row.extend([int(0.299 * r + 0.587 * g + 0.114 * b < 128)] * max(1, min(span, 200)))
+            grid.append(row)
+        width = max(len(r) for r in grid)
+        if len(colors) < 2 or width < 21 or width > 200 or min(len(r) for r in grid) < width - 1:
+            continue
+        images.append(_grid_to_image([r + [0] * (width - len(r)) for r in grid]))
+    return images
+
+
+def _block_character_qr_images(text):
+    """QR codes drawn with full/half block characters (one char = two vertical modules)."""
+    if not any(c in text for c in "█▀▄"):
+        return []
+    images, run = [], []
+    for line in text.splitlines() + [""]:
+        blocks = sum(c in "█▀▄■▓" for c in line)
+        if blocks >= 10 and all(c in _HALF_BLOCKS for c in line.rstrip()):
+            run.append(line.rstrip())
+            continue
+        if len(run) >= 10:
+            width = max(len(r) for r in run)
+            grid = []
+            for r in run:
+                cells = [_HALF_BLOCKS.get(c, (0, 0)) for c in r.ljust(width)]
+                grid.append([top for top, _ in cells])
+                grid.append([bottom for _, bottom in cells])
+            images.append(_grid_to_image(grid))
+        run = []
+    return images
+
+
+def _message_images(msg):
+    """Yield (image bytes, origin) without fetching remote content; count what was not scanned."""
+    import base64
+    import io
+    import zipfile
+    unscanned = 0
+    found = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        name = str(part.get_filename() or "").lower()
+        ctype = part.get_content_type()
+        try:
+            data = part.get_payload(decode=True) or b""
+        except Exception:
+            continue
+        if len(data) > ATTACHMENT_MAX_BYTES:
+            unscanned += ctype.startswith("image/") or name.endswith(tuple(_IMAGE_EXTENSIONS))
+            continue
+        if ctype == "image/svg+xml" or name.endswith(".svg"):
+            unscanned += 1
+        elif ctype.startswith("image/") or os.path.splitext(name)[1] in _IMAGE_EXTENSIONS:
+            found.append((data, "mime_image"))
+        elif data.startswith(b"PK\x03\x04"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    for member in archive.infolist()[:ATTACHMENT_MAX_MEMBERS]:
+                        if os.path.splitext(member.filename.lower())[1] in _IMAGE_EXTENSIONS:
+                            if member.file_size > ATTACHMENT_MAX_BYTES or member.flag_bits & 1:
+                                unscanned += 1
+                            else:
+                                found.append((archive.read(member), "attachment_container"))
+            except Exception:
+                unscanned += 1
+        elif data.startswith(b"%PDF-"):
+            try:
+                import fitz  # PyMuPDF, optional: renders pages so QR codes in PDFs can be read.
+            except ImportError:
+                unscanned += 1
+                continue
+            try:
+                with fitz.open(stream=data, filetype="pdf") as document:
+                    for page in list(document)[:QR_MAX_PDF_PAGES]:
+                        found.append((page.get_pixmap(dpi=150).tobytes("png"), "attachment_container"))
+            except Exception:
+                unscanned += 1
+    _, markup = _get_email_body(msg)
+    for match in re.finditer(r"data:image/(?:png|jpe?g|gif|bmp|webp);base64,([A-Za-z0-9+/=\s]{40,})", markup, re.I):
+        payload = re.sub(r"\s+", "", match.group(1))
+        if len(payload) > ATTACHMENT_MAX_BYTES * 4 // 3:
+            unscanned += 1
+            continue
+        try:
+            found.append((base64.b64decode(payload + "=" * (-len(payload) % 4)), "html_data_uri"))
+        except ValueError:
+            unscanned += 1
+    unscanned += len(re.findall(r"<img\b[^>]*\bsrc\s*=\s*[\"']?\s*(?:https?:)?//", markup, re.I))
+    unscanned += max(0, len(found) - QR_MAX_IMAGES)
+    return found[:QR_MAX_IMAGES], unscanned
+
+
+def _qr_kind(payload):
+    text = payload.strip()
+    for pattern, kind in _QR_KINDS:
+        if re.match(pattern, text, re.I):
+            return kind
+    return "url" if re.fullmatch(r"[\w-]+(?:\.[\w-]+)+\.[a-z]{2,}(?:[/?#]\S*)?|[\w-]+\.[a-z]{2,}(?:[/?#]\S*)?",
+                                 text, re.I) else "text"
+
+
+def inspect_email_qr_codes(raw_or_message):
+    """Decoded QR payloads with origin, plus QR_FEATURE_NAMES values; cached on the message."""
+    msg = _parse_email(raw_or_message)
+    if hasattr(msg, "_pipeline_qr"):
+        return msg._pipeline_qr
+    codes, limitations = [], []
+    images, unscanned = _message_images(msg)
+    for data, origin in images:
+        texts, problem = _decode_qr_image(data)
+        if problem:
+            unscanned += 1
+            limitations.append(problem)
+        codes.extend({"payload": t, "origin": origin} for t in texts)
+    plain, markup = _get_email_body(msg)
+    drawn = _html_table_qr_images(markup) + _block_character_qr_images(plain + "\n" + _strip_html(markup))
+    for image in drawn:
+        codes.extend({"payload": t, "origin": "drawn_in_markup"} for t in _read_qr(image))
+    if unscanned:
+        limitations.append(f"{unscanned} image(s) not scanned (remote, SVG, PDF without renderer, or limits)")
+    sender = parseaddr(str(msg.get("From", "")))[1]
+    sender_domain = registrable_domain(_address_domain(sender)) if "@" in sender else ""
+    links = _find_urls(plain, markup)
+    link_domains = {url_group_key(u) for u in links}
+    values = defaultdict(float)
+    for code in codes:
+        code["kind"] = _qr_kind(code["payload"])
+        values["qr_code_count"] += 1
+        values["qr_in_attachment_count"] += code["origin"] == "attachment_container"
+        values["qr_rendered_from_markup_count"] += code["origin"] == "drawn_in_markup"
+        if code["kind"] != "url":
+            values["qr_non_url_payload_count"] += 1
+            continue
+        lexical = dict(zip(URL_LEXICAL_FEATURE_NAMES, extract_url_lexical_features(code["payload"])))
+        domain = url_group_key(code["payload"])
+        code["domain"] = domain
+        values["qr_url_count"] += 1
+        values["qr_url_sender_domain_mismatch"] += bool(sender_domain) and domain != sender_domain
+        values["qr_url_not_in_email_links"] += domain not in link_domains
+        values["qr_url_risky_host_count"] += any(lexical[n] for n in (
+            "url_host_is_ip", "url_is_shortener", "url_suspicious_tld", "url_has_at_symbol",
+            "url_has_punycode", "url_has_port", "url_executable_extension"))
+        values["qr_url_sensitive_word_count"] += lexical["url_sensitive_word_count"]
+    values["qr_only_link"] = float(values["qr_url_count"] > 0 and not links)
+    values["qr_unscanned_image_count"] = float(unscanned)
+    msg._pipeline_qr = {"codes": codes, "limitations": limitations,
+                        "features": {n: float(values[n]) for n in QR_FEATURE_NAMES}}
+    return msg._pipeline_qr
+
+
+def extract_qr_features(raw_text):
+    return inspect_email_qr_codes(raw_text)["features"]
+
+
+# --------------------------------------------------------------------------
+# 9. Brand impersonation, link context, attachment payloads, BEC content
+#    (Phishing Email Investigation Guide, Ch. 7.3, 9.2-9.4, 10.1, 11.1, 18.4.3, 20.1)
+# --------------------------------------------------------------------------
+
+# brand -> (name tokens, official registrable domains). A domain is also treated as
+# official when its registrable label equals a token (regional sites: amazon.de, dhl.de).
+BRAND_DOMAINS = {
+    "paypal": ({"paypal"}, {"paypal.com", "paypal.me", "paypalobjects.com", "paypal-community.com"}),
+    "microsoft": ({"microsoft", "office365", "onedrive", "sharepoint", "outlook"},
+                  {"microsoft.com", "office.com", "office365.com", "live.com", "outlook.com", "hotmail.com",
+                   "msn.com", "microsoftonline.com", "sharepoint.com", "onmicrosoft.com", "windows.net",
+                   "azure.com", "bing.com", "skype.com", "onedrive.com", "office.net"}),
+    "apple": ({"apple", "icloud"}, {"apple.com", "icloud.com", "itunes.com", "me.com", "mzstatic.com"}),
+    "amazon": ({"amazon"}, {"amazon.com", "amazonses.com", "amazonaws.com", "media-amazon.com", "ssl-images-amazon.com"}),
+    "google": ({"google", "gmail"}, {"google.com", "gmail.com", "googlemail.com", "googleusercontent.com",
+                                     "googleapis.com", "gstatic.com", "youtube.com", "goo.gl",
+                                     "googleadservices.com", "googletagmanager.com", "googlesyndication.com",
+                                     "googlegroups.com", "googleblog.com", "google-analytics.com"}),
+    "netflix": ({"netflix"}, {"netflix.com", "nflxext.com", "nflximg.net"}),
+    "facebook": ({"facebook", "instagram", "whatsapp"},
+                 {"facebook.com", "facebookmail.com", "fb.com", "fbcdn.net", "instagram.com", "whatsapp.com", "meta.com"}),
+    "linkedin": ({"linkedin"}, {"linkedin.com", "licdn.com"}),
+    "dhl": ({"dhl"}, {"dhl.com"}), "fedex": ({"fedex"}, {"fedex.com"}), "ups": ({"ups"}, {"ups.com"}),
+    "usps": ({"usps"}, {"usps.com", "usps.gov"}), "irs": ({"irs"}, {"irs.gov"}),
+    "chase": ({"chase"}, {"chase.com", "jpmorganchase.com", "jpmorgan.com"}),
+    "wellsfargo": ({"wellsfargo"}, {"wellsfargo.com", "wf.com"}),
+    "bankofamerica": ({"bankofamerica"}, {"bankofamerica.com", "bofa.com", "ml.com"}),
+    "citibank": ({"citibank"}, {"citibank.com", "citi.com"}),
+    "americanexpress": ({"americanexpress", "amex"}, {"americanexpress.com", "aexp.com"}),
+    "docusign": ({"docusign"}, {"docusign.com", "docusign.net"}),
+    "dropbox": ({"dropbox"}, {"dropbox.com", "dropboxmail.com", "dropboxusercontent.com"}),
+    "adobe": ({"adobe"}, {"adobe.com", "adobesign.com", "acrobat.com"}),
+    "ebay": ({"ebay"}, {"ebay.com", "ebayimg.com", "ebaystatic.com"}),
+    "yahoo": ({"yahoo"}, {"yahoo.com", "yahoo.net", "yimg.com"}),
+    "aol": ({"aol"}, {"aol.com"}), "att": ({"att"}, {"att.com", "att.net"}),
+    "verizon": ({"verizon"}, {"verizon.com", "verizon.net", "verizonwireless.com"}),
+    "coinbase": ({"coinbase"}, {"coinbase.com"}), "binance": ({"binance"}, {"binance.com"}),
+    "steam": ({"steamcommunity", "steampowered"}, {"steamcommunity.com", "steampowered.com"}),
+}
+_BRAND_TOKENS = {token: brand for brand, (tokens, _) in BRAND_DOMAINS.items() for token in tokens}
+# Free hosting / site builders / tunnels: reputable infrastructure abused to host kits (Ch. 20.1).
+FREE_HOSTING_SUFFIXES = (
+    "weebly.com", "weeblysite.com", "wixsite.com", "web.app", "firebaseapp.com", "appspot.com",
+    "glitch.me", "workers.dev", "pages.dev", "netlify.app", "vercel.app", "github.io", "gitlab.io",
+    "herokuapp.com", "000webhostapp.com", "blogspot.com", "sites.google.com", "ipfs.io", "dweb.link",
+    "cf-ipfs.com", "r2.dev", "azurewebsites.net", "square.site", "godaddysites.com", "mystrikingly.com",
+    "jimdosite.com", "webflow.io", "framer.app", "ngrok.io", "ngrok-free.app", "trycloudflare.com",
+    "duckdns.org", "replit.app", "repl.co", "notion.site", "typedream.app", "carrd.co")
+_SKELETON_PAIRS = (("rn", "m"), ("vv", "w"), ("cl", "d"))
+_SKELETON_CHARS = str.maketrans({"0": "o", "1": "l", "i": "l", "|": "l", "3": "e", "5": "s", "$": "s", "@": "a"})
+
+
+def _skeleton(label):
+    """Visual skeleton for lookalike comparison: homoglyphs, I/l/1, 0/o, rn/m, vv/w."""
+    label = unicodedata.normalize("NFKC", label.lower()).translate(_HOMOGLYPHS)
+    label = "".join(c for c in unicodedata.normalize("NFKD", label) if not unicodedata.combining(c)).lower()
+    for pair, replacement in _SKELETON_PAIRS:
+        label = label.replace(pair, replacement)
+    return label.translate(_SKELETON_CHARS)
+
+
+def _edit_distance(a, b):
+    """Optimal string alignment distance (one transposition counts as one edit)."""
+    previous2, previous = None, list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb))
+            if previous2 is not None and i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                current[j] = min(current[j], previous2[j - 2] + 1)
+        previous2, previous = previous, current
+    return previous[-1]
+
+
+@lru_cache(maxsize=131072)
+def brand_impersonation(host):
+    """(brand, 'lookalike'|'combosquat') when a host imitates a brand it does not belong to.
+
+    lookalike: a label visually equals or is one edit from a brand (paypa1, rnicrosoft,
+    suppIies-style homoglyphs). combosquat: the brand name is embedded in someone else's
+    domain (paypal-secure.com, paypal.com.evil.tk). Official domains return None.
+    """
+    host = str(host).lower().strip(".")
+    if not host or re.fullmatch(r"[\d.]+|\[?[0-9a-f:]+\]?", host):
+        return None
+    labels = []
+    for label in host.split("."):
+        if label.startswith("xn--"):
+            try:
+                label = label.encode("ascii").decode("idna")
+            except (UnicodeError, ValueError):
+                pass
+        labels.append(label)
+    host = ".".join(labels)
+    registered = registrable_domain(host)
+    registered_label = registered.split(".")[0]
+    parts = [p for label in labels for p in label.split("-") if p]
+    for part in parts:
+        skeleton = _skeleton(part)
+        for token, brand in _BRAND_TOKENS.items():
+            if part == token or abs(len(part) - len(token)) > 1:
+                continue
+            # Edit distance only for long names: "apply"/"apple", "tunes"/"itunes" are real words.
+            if skeleton == _skeleton(token) or (len(token) >= 6 and _edit_distance(part, token) == 1):
+                return brand, "lookalike"
+    for token, brand in _BRAND_TOKENS.items():
+        official = BRAND_DOMAINS[brand][1]
+        if registered in official or registered_label == token:
+            continue
+        # Short names must be a whole part ("purchase" must not match "chase").
+        if any(p == token or (len(token) >= 6 and (p.startswith(token) or p.endswith(token)))
+               or (len(token) >= 8 and token in p) for p in parts):
+            return brand, "combosquat"
+    return None
+
+
+def _brand_in_text(text):
+    words = set(re.findall(r"[a-z0-9]+", str(text).lower()))
+    joined = re.sub(r"[^a-z0-9]", "", str(text).lower())
+    return {brand for token, brand in _BRAND_TOKENS.items()
+            if token in words or (len(token) >= 8 and token in joined)}
+
+
+def _is_official_for(brand, host):
+    registered = registrable_domain(str(host).lower())
+    tokens, official = BRAND_DOMAINS[brand]
+    return registered in official or registered.split(".")[0] in tokens
+
+
+LINK_FEATURE_NAMES = [
+    "link_recipient_address_count", "link_open_redirect_count", "link_brand_lookalike_count",
+    "link_brand_combosquat_count", "link_anchor_brand_mismatch_count", "link_free_hosting_count",
+]
+_OPEN_REDIRECT = re.compile(r"[?&#][\w.\-\[\]]*=(?:https?(?::|%3a)(?://|%2f%2f)|%2f%2f|//|www\.)", re.I)
+
+
+def _recipient_markers(msg):
+    """Recipient addresses as they appear when a kit personalises a URL (Ch. 3.3, 10.1)."""
+    import base64
+    from urllib.parse import quote
+    raw = getattr(msg, "_pipeline_raw_headers", None) or {}
+    values = [str(v) for v in (raw.get("To") or msg.get_all("To") or [])] + [str(v) for v in (msg.get_all("Cc") or [])]
+    markers = set()
+    for _, address in getaddresses([_decode_header_value(v) for v in values]):
+        address = address.strip().lower()
+        if "@" not in address or len(address) < 6:
+            continue
+        encoded = address.encode()
+        markers.update({address, quote(address, safe="").lower(),
+                        base64.b64encode(encoded).decode().rstrip("=").lower(),
+                        base64.urlsafe_b64encode(encoded).decode().rstrip("=").lower()})
+    return markers
+
+
+def extract_link_features(msg):
+    """Per-email link context the lexical URL counts miss."""
+    msg = _parse_email(msg)
+    plain, markup = _get_email_body(msg)
+    urls = _find_urls(plain, markup)
+    markers = _recipient_markers(msg)
+    values = defaultdict(float)
+    for url in urls:
+        lowered = url.lower()
+        values["link_recipient_address_count"] += any(m in lowered for m in markers)
+        values["link_open_redirect_count"] += bool(_OPEN_REDIRECT.search(url))
+        host = (_safe_urlparse(normalize_url(url)).hostname or "").lower()
+        verdict = brand_impersonation(host)
+        if verdict:
+            values["link_brand_" + verdict[1] + "_count"] += 1
+        values["link_free_hosting_count"] += any(host == s or host.endswith("." + s) for s in FREE_HOSTING_SUFFIXES)
+    for match in re.finditer(r'<a\b[^>]*\bhref\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</a\s*>', markup, re.I | re.S):
+        href = html_module.unescape(match.group(1)).strip()
+        if not re.match(r"(?:https?:)?//|www\.", href, re.I):
+            continue
+        host = (_safe_urlparse(normalize_url(href.lstrip("/"))).hostname or "").lower()
+        anchor = _strip_html(match.group(2))
+        brands = _brand_in_text(anchor)
+        values["link_anchor_brand_mismatch_count"] += bool(brands) and not any(_is_official_for(b, host) for b in brands)
+    return {name: float(values[name]) for name in LINK_FEATURE_NAMES}
+
+
+ATTACHMENT_PAYLOAD_FEATURE_NAMES = [
+    "attachment_vba_autoexec_count", "attachment_vba_suspicious_count", "attachment_vba_stomping_count",
+    "attachment_xlm_macro_count", "attachment_html_smuggling_count", "attachment_password_archive_in_body",
+    "attachment_disk_image_count", "attachment_lnk_command_count", "attachment_onenote_embedded_count",
+    "attachment_pdf_uri_count", "attachment_config_profile_count",
+]
+# Apple configuration profiles install mail/CalDAV/CardDAV accounts, root certificates,
+# VPN or MDM enrolment once opened on iOS/macOS. Signed profiles are PKCS#7 with the
+# plist in clear, so the content is checked, not only the extension. Phishing Pot:
+# about 100 such attachments; the other corpora have none.
+_PROFILE_MARKER = re.compile(rb"<key>\s*PayloadType\s*</key>\s*<string>\s*Configuration\s*</string>")
+_ONENOTE_MAGIC = bytes.fromhex("e4525c7b8cd8a74daeb15378d02996d3")
+_ONENOTE_FILE_DATA = bytes.fromhex("e716e3bd65261145a4c48d4d0b7a9eac")
+_LNK_MAGIC = b"L\0\0\0\x01\x14\x02\0"
+_LNK_COMMAND = re.compile(r"powershell|pwsh|cmd(?:\.exe)?\s*/[ck]|mshta|wscript|cscript|rundll32|regsvr32|"
+                          r"bitsadmin|certutil|curl(?:\.exe)?\s|https?://", re.I)
+_SMUGGLING_SAVE = re.compile(rb"createObjectURL|msSaveOrOpenBlob|msSaveBlob|\.download\s*=|\bdownload\s*=", re.I)
+_BODY_PASSWORD = re.compile(r"\b(?:password|passcode|pwd|pass)\b\s*(?:is|:|=|-)?\s*\S{3,}|m[aậ]t\s*kh[aẩ]u", re.I)
+_OFFICE_EXTENSIONS = {".doc", ".dot", ".xls", ".xlt", ".xla", ".ppt", ".pps", ".pot", ".docx", ".docm", ".dotm",
+                      ".xlsx", ".xlsm", ".xlsb", ".xltm", ".xlam", ".pptx", ".pptm", ".ppsm", ".potm", ".rtf", ".mht"}
+
+
+def _attachment_blobs(msg):
+    """(name, bytes, encrypted) for MIME attachments and first-level archive members, bounded."""
+    import io
+    import zipfile
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        name = str(part.get_filename() or "")
+        if not (part.get_content_disposition() == "attachment" or name):
+            continue
+        try:
+            data = part.get_payload(decode=True) or b""
+        except Exception:
+            continue
+        if len(data) > ATTACHMENT_MAX_BYTES:
+            continue
+        yield name, data, False
+        if not data.startswith(b"PK\x03\x04") or os.path.splitext(name.lower())[1] in _OFFICE_ZIP_EXTENSIONS:
+            continue
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                for member in archive.infolist()[:ATTACHMENT_MAX_MEMBERS]:
+                    if member.is_dir():
+                        continue
+                    if member.flag_bits & 1:
+                        yield member.filename, b"", True
+                    elif (member.file_size <= ATTACHMENT_MAX_BYTES and
+                          member.file_size / max(member.compress_size, 1) <= ATTACHMENT_MAX_RATIO):
+                        yield member.filename, archive.read(member), False
+        except Exception:
+            continue
+
+
+def _vba_indicators(name, data):
+    """olevba static analysis; macros are parsed, never executed."""
+    import logging
+    try:
+        from oletools.olevba import VBA_Parser
+    except ImportError:
+        return None
+    logging.getLogger("olevba").setLevel(logging.CRITICAL)
+    try:
+        parser = VBA_Parser(name or "attachment", data=data)
+    except Exception:
+        return None
+    try:
+        result = {"autoexec": 0, "suspicious": 0, "stomping": 0, "xlm": 0}
+        try:
+            result["xlm"] = int(bool(parser.detect_xlm_macros()))
+        except Exception:
+            pass
+        if parser.detect_vba_macros():
+            kinds = [kind for kind, _, _ in parser.analyze_macros()]
+            result["autoexec"] = int("AutoExec" in kinds)
+            result["suspicious"] = kinds.count("Suspicious")
+            try:
+                result["stomping"] = int(bool(parser.detect_vba_stomping()))
+            except Exception:
+                pass
+        return result
+    finally:
+        parser.close()
+
+
+def extract_attachment_payload_features(msg):
+    msg = _parse_email(msg)
+    values = defaultdict(float)
+    encrypted_archive = False
+    for name, data, encrypted in _attachment_blobs(msg):
+        if encrypted:
+            encrypted_archive = True
+            continue
+        low = name.lower()
+        ext = os.path.splitext(low)[1]
+        magic = _attachment_magic(data)
+        if magic == "ole" or ext in _OFFICE_EXTENSIONS or (magic == "zip" and b"vbaProject.bin" in data):
+            vba = _vba_indicators(name, data)
+            if vba:
+                values["attachment_vba_autoexec_count"] += vba["autoexec"]
+                values["attachment_vba_suspicious_count"] += vba["suspicious"]
+                values["attachment_vba_stomping_count"] += vba["stomping"]
+                values["attachment_xlm_macro_count"] += vba["xlm"]
+        if ext in {".htm", ".html", ".shtml", ".xhtml", ".svg", ".hta"} or (
+                magic == "text" and re.search(rb"<\s*(?:html|svg)\b", data[:4096], re.I)):
+            blob = re.search(rb"\bnew\s+Blob\s*\(|\bBlob\s*\(", data)
+            decoded = re.search(rb"\batob\s*\(", data) and re.search(rb"[A-Za-z0-9+/]{2000,}={0,2}", data)
+            values["attachment_html_smuggling_count"] += bool((blob or decoded) and _SMUGGLING_SAVE.search(data))
+        if ext in {".iso", ".img", ".vhd", ".vhdx"} or data[0x8001:0x8006] == b"CD001" or data.startswith(b"vhdxfile"):
+            values["attachment_disk_image_count"] += 1
+        if data.startswith(_LNK_MAGIC):
+            strings = data.decode("utf-16le", errors="ignore") + data.decode("latin-1")
+            values["attachment_lnk_command_count"] += bool(_LNK_COMMAND.search(strings))
+        if data.startswith(_ONENOTE_MAGIC):
+            values["attachment_onenote_embedded_count"] += data.count(_ONENOTE_FILE_DATA)
+        if magic == "pdf":
+            pdf = re.sub(rb"#([0-9a-fA-F]{2})", lambda m: bytes([int(m[1], 16)]), data)
+            values["attachment_pdf_uri_count"] += len(re.findall(rb"/URI\s*\(", pdf))
+        if ext == ".mobileconfig" or _PROFILE_MARKER.search(data):
+            values["attachment_config_profile_count"] += 1
+    if encrypted_archive:
+        plain, _ = _get_email_body(msg)
+        visible = _deobfuscated_message_text(msg)[0]
+        values["attachment_password_archive_in_body"] = float(bool(_BODY_PASSWORD.search(plain + "\n" + visible)))
+    return {name: float(values[name]) for name in ATTACHMENT_PAYLOAD_FEATURE_NAMES}
+
+
+# BEC / callback indicators (Ch. 9.4). The corpora contain almost no BEC, so these are
+# evidence for a rule layer, not model inputs.
+CONTENT_INDICATOR_NAMES = [
+    "bec_secrecy_count", "bec_channel_switch_count", "bec_payment_change_count",
+    "bec_gift_card_count", "callback_phone_count", "mail_merge_token_count",
+]
+_CONTENT_PATTERNS = {
+    "bec_secrecy_count": r"\b(?:keep (?:this|it) (?:confidential|between us|quiet|private)|"
+                         r"(?:do not|don't) (?:tell|share|discuss|mention) (?:this|it|anyone|anybody|others)|"
+                         r"confidential until)\b",
+    "bec_channel_switch_count": r"\b(?:text me|whatsapp me|call me (?:on|at)|my (?:new|personal|private) "
+                                r"(?:number|cell|phone|email)|reach me (?:on|at) my)\b",
+    "bec_payment_change_count": r"\b(?:new (?:bank|account|banking|remittance) (?:details|information|info)|"
+                                r"updated? (?:bank|remittance|payment|banking) (?:details|information)|"
+                                r"change (?:of|in|to) (?:our )?(?:bank|account) details|wire (?:the )?(?:transfer|payment))\b",
+    "bec_gift_card_count": r"\b(?:gift ?cards?|itunes cards?|google play cards?|steam cards?)\b",
+    "mail_merge_token_count": r"%%[A-Z_]+%%|\{\{\s*\w+\s*\}\}|\[(?:FIRST_?NAME|EMAIL|NAME)\]|\$\{\w+\}",
+}
+_PHONE = re.compile(r"(?<!\d)(?:\+?\d{1,3}[ .-]?)?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}(?!\d)")
+
+
+def extract_content_indicators(msg):
+    msg = _parse_email(msg)
+    text = _deobfuscated_message_text(msg)[0]
+    values = {name: float(len(re.findall(pattern, text, re.I))) for name, pattern in _CONTENT_PATTERNS.items()}
+    values["callback_phone_count"] = float(len(_PHONE.findall(text))) if re.search(
+        r"\b(?:call|phone|dial|contact (?:us|support))\b[^.\n]{0,80}\b(?:cancel|renew|subscription|refund|charged?|order)\b|"
+        r"\b(?:cancel|renew|subscription|refund|charged?|order)\b[^.\n]{0,80}\b(?:call|phone|dial)\b", text, re.I) else 0.0
+    return {name: values[name] for name in CONTENT_INDICATOR_NAMES}
+
+
+# --------------------------------------------------------------------------
 # HÀM TỔNG — dùng trong train.py / model_deployment.py
 # --------------------------------------------------------------------------
 
@@ -1290,11 +2186,8 @@ def split_train_validation_test(data, validation_size=0.2, test_size=0.2, seed=4
 
 def prepare_semantic_text(raw):
     """Decoded subject/body for BERT; preserve sentences, negation and word order."""
-    msg = _parse_email(raw)
-    plain, markup = _get_email_body(msg)
-    bodies = list(dict.fromkeys(s.strip() for s in (plain, _strip_html(markup)) if s.strip()))
-    subject = _content_subject(msg).strip()
-    text = _without_template_phrases("\n\n".join(([subject] if subject else []) + bodies))
+    # Visible text after deobfuscation: hidden "salting" text never reaches BERT.
+    text = _deobfuscated_message_text(_parse_email(raw))[0]
     return unicodedata.normalize("NFC", text.replace("\x00", " ")).strip() or "[empty email]"
 
 

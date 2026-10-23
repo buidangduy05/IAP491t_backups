@@ -14,7 +14,9 @@ from preprocess import (_parse_email, _get_email_body, _strip_html, _normalize,
                         _english_stopwords, compute_dedup_key, cleanText,
                         remove_stopwords, prepare_semantic_text, extract_engineered_features,
                         extract_html_features, extract_html_security_features,
-                        extract_message_security_features)
+                        extract_message_security_features, extract_text_obfuscation_features,
+                        extract_link_features, extract_attachment_payload_features,
+                        extract_content_indicators)
 
 
 def preprocessing_signature():
@@ -53,6 +55,11 @@ def _process(job):
         return {'_clean_text': text, '_features': extract_engineered_features(msg),
                 '_html_features': {**extract_html_features(markup), **extract_html_security_features(markup)},
                 '_message_security': extract_message_security_features(msg),
+                # Evidence only (source-dependent in these corpora); not model inputs.
+                '_text_obfuscation': extract_text_obfuscation_features(msg),
+                '_link_features': extract_link_features(msg),
+                '_attachment_payload': extract_attachment_payload_features(msg),
+                '_content_indicators': extract_content_indicators(msg),
                 '_header_available': any(bool(str(msg.get(h, '')).strip()) for h in ('From', 'To', 'Reply-To')),
                 '_text_available': bool(str(msg.get('Subject', '')).strip() or plain.strip() or _strip_html(markup).strip())}
     except Exception as exc:

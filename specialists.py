@@ -16,7 +16,11 @@ from xgboost import XGBClassifier
 
 from evaluate import classification_metrics, positive_scores, select_threshold, file_digest
 from preprocess import (FEATURE_NAMES, HTML_SECURITY_FEATURE_NAMES, MESSAGE_SECURITY_FEATURE_NAMES,
+                        LINK_FEATURE_NAMES, ATTACHMENT_PAYLOAD_FEATURE_NAMES,
                         group_email_variants, split_train_validation_test)
+
+# Branch-only feature dicts stored per email by the features stage.
+EXTRA_FEATURE_COLUMNS = ('_message_security', '_link_features', '_attachment_payload')
 
 
 BRANCHES = {
@@ -29,17 +33,20 @@ BRANCHES = {
         'has_form_tag', 'has_script_tag', 'has_hidden_elements', 'is_image_only',
         'html_to_text_ratio', *HTML_SECURITY_FEATURE_NAMES]},
     'attachment': {'algorithm': 'XGBoost', 'target': 'attachment_malicious',
-                   'features': [n for n in FEATURE_NAMES if 'attachment' in n]},
+                   'features': [*[n for n in FEATURE_NAMES if 'attachment' in n], *ATTACHMENT_PAYLOAD_FEATURE_NAMES]},
     'url': {'algorithm': 'SVM', 'target': 'email_phishing', 'features': [
         'num_urls', 'num_unique_domains', 'num_ip_urls', 'num_shortened_urls',
         'num_at_symbol_urls', 'num_https_urls', 'num_http_urls',
-        'num_suspicious_tld_urls', 'avg_url_length', 'max_url_length', 'num_anchor_href_mismatch']},
+        'num_suspicious_tld_urls', 'avg_url_length', 'max_url_length', 'num_anchor_href_mismatch',
+        *LINK_FEATURE_NAMES]},
 }
 
 
 def feature_dict(row):
-    return {**dict(zip(FEATURE_NAMES, row['_features'])), **row['_html_features'],
-            **row['_message_security']}
+    merged = {**dict(zip(FEATURE_NAMES, row['_features'])), **row['_html_features']}
+    for column in EXTRA_FEATURE_COLUMNS:
+        merged.update(row[column])
+    return merged
 
 
 def availability(row):
@@ -124,13 +131,15 @@ def prepare_specialists(data, output, cache_dir, workers=None, target_mode='phis
                 extra = [n for n in spec['features'] if n not in FEATURE_NAMES]
                 vectors = np.ascontiguousarray(matrix[:, [FEATURE_NAMES.index(n) for n in shared]])
                 if extra:
+                    rows = zip(*(prepared[column] for column in EXTRA_FEATURE_COLUMNS))
                     vectors = np.hstack([vectors, np.asarray(
-                        [[item[n] for n in extra] for item in prepared['_message_security']], dtype=np.float32)])
+                        [[merged[n] for n in extra] for merged in ({k: v for d in row for k, v in d.items()}
+                                                                    for row in rows)], dtype=np.float32)])
             prepared[f'_{name}_vector'] = list(vectors)
     del matrix
     # Raw MIME stays in original dataset; retain only prepared inputs for resuming.
     prepared = prepared.drop(columns=['Text', '_group_body', '_clean_text', '_features', '_html_features',
-                                      '_message_security'])
+                                      *EXTRA_FEATURE_COLUMNS, '_text_obfuscation', '_content_indicators'])
     parts = dict(zip(('train', 'validation', 'test'), split_train_validation_test(prepared, seed=seed)))
     provenance = ['RecordId', 'Source', 'Location', 'LabelKind', 'LabelBasis',
                   'OriginalLabel', 'Class', '_dedup_key', '_group']
@@ -159,10 +168,13 @@ def branch_inputs(frame, name):
 
 def train_specialists(parts, output, branch_labels=None, precision_target=0.9,
                       train_text=True, bert_model_name='google-bert/bert-base-uncased',
-                      bert_epochs=3, preprocessing=None, prepare_only=False):
+                      bert_epochs=3, preprocessing=None, prepare_only=False, target_mode='phishing'):
+    from train import POSITIVE_LABELS
     output = Path(output)
     annotations = load_branch_labels(branch_labels, pd.concat(parts.values(), ignore_index=True))
+    # Class 1 of email-level branches is POSITIVE_LABELS[target_mode]; in stage 2 Class 0 is spam.
     manifest = {'schema_version': 1, 'kind': 'five_specialists', 'status': 'incomplete',
+                'target_mode': target_mode, 'positive_label': POSITIVE_LABELS[target_mode],
                 'preprocessing': preprocessing, 'branches': {}, 'test_used_for_selection': False,
                 'selection_note': 'BERT requested; other algorithms from prior top-five F1. '
                                   'Prior scores do not establish specialist performance.'}
@@ -170,7 +182,7 @@ def train_specialists(parts, output, branch_labels=None, precision_target=0.9,
     def save():
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     save()
-    metrics, trials = [], []
+    metrics, trials, by_source = [], [], []
     for name, spec in BRANCHES.items():
         config = {**spec, 'status': 'preparing', 'precision_target': precision_target,
                   'label_source': 'email phishing label' if spec['target'] == 'email_phishing' else 'reviewed branch annotations'}
@@ -205,7 +217,7 @@ def train_specialists(parts, output, branch_labels=None, precision_target=0.9,
             from preprocess import BertEmailClassifier
             model = BertEmailClassifier.from_pretrained(bert_model_name, batch_size=BERT_BATCH_SIZE,
                                                         max_length=BERT_MAX_LENGTH, stride=BERT_STRIDE)
-            model.model.config.email_positive_label = 'phishing'
+            model.model.config.email_positive_label = POSITIVE_LABELS[target_mode]
             model, decision, bert_trials, _ = train_bert_classifier(
                 model, branch_inputs(train_frame, name), y_train,
                 branch_inputs(val_frame, name), y_val, output / 'text_bert', precision_target, epochs=bert_epochs)
@@ -240,6 +252,12 @@ def train_specialists(parts, output, branch_labels=None, precision_target=0.9,
                                 **classification_metrics(y, scores, config['threshold'])})
                 pd.DataFrame({'RecordId': frame.RecordId.to_list(), 'Label': y, 'Score': scores}).to_csv(
                     output / f'{name}_{split}_scores.csv', index=False)
+                # Per-source flag rates expose a branch that learned the corpus instead of the class.
+                flagged = scores >= config['threshold']
+                for source, index in frame.groupby('Source').indices.items():
+                    by_source.append({'Branch': name, 'Split': split, 'Source': source, 'Rows': len(index),
+                                      'Positives': int(y[index].sum()), 'Flagged': int(flagged[index].sum()),
+                                      'FlaggedRate': float(flagged[index].mean())})
         save()
         if name == 'text':
             del model
@@ -250,8 +268,11 @@ def train_specialists(parts, output, branch_labels=None, precision_target=0.9,
         'Accuracy', 'F1-score', 'F2-score', 'Precision', 'Recall', 'ROC-AUC', 'Average-Precision',
         'FPR', 'FNR', 'TN', 'FP', 'FN', 'TP']).to_csv(output / 'specialist_evaluation.csv', index=False)
     pd.DataFrame(trials).to_csv(output / 'specialist_validation.csv', index=False)
+    pd.DataFrame(by_source, columns=['Branch', 'Split', 'Source', 'Rows', 'Positives', 'Flagged', 'FlaggedRate']).to_csv(
+        output / 'specialist_evaluation_by_source.csv', index=False)
     manifest['status'] = 'complete' if all(c['status'] == 'trained' for c in manifest['branches'].values()) else 'partial'
     artifacts = ['prepared_specialists.pkl', 'split_manifest.csv', 'specialist_evaluation.csv', 'specialist_validation.csv',
+                 'specialist_evaluation_by_source.csv',
                  'train_metadata.csv', 'validation_metadata.csv', 'test_metadata.csv']
     for name, config in manifest['branches'].items():
         if config['status'] == 'trained':
@@ -317,7 +338,7 @@ def evaluate_specialists(output):
 
 def run_specialists(output, dataset_dir=None, cache_dir=None, workers=None,
                     branch_labels=None, prepare_only=False, train_text=True, bert_epochs=3,
-                    bert_model_name='google-bert/bert-base-uncased', resume=None):
+                    bert_model_name='google-bert/bert-base-uncased', resume=None, target_mode='phishing'):
     from train import load_training_emails
     output = Path(output)
     if output.exists() and any(output.iterdir()):
@@ -333,6 +354,9 @@ def run_specialists(output, dataset_dir=None, cache_dir=None, workers=None,
         current, _ = preprocessing_signature()
         if previous['preprocessing']['signature'] != current:
             raise RuntimeError('Preprocessing changed; prepare a new run before resuming')
+        # Runs before the two-stage filter recorded no target mode; they were all 'phishing'.
+        if previous.get('target_mode', 'phishing') != target_mode:
+            raise RuntimeError(f"Resumed run was prepared for target mode {previous.get('target_mode', 'phishing')}")
         parts = pd.read_pickle(resume / 'prepared_specialists.pkl')
         preprocessing = previous['preprocessing']
         import shutil
@@ -345,9 +369,10 @@ def run_specialists(output, dataset_dir=None, cache_dir=None, workers=None,
     else:
         data = load_training_emails(output, dataset_dir=dataset_dir)
         parts, preprocessing = prepare_specialists(data, output,
-            cache_dir or Path(__file__).resolve().parent / '.pipeline_cache', workers=workers)
+            cache_dir or Path(__file__).resolve().parent / '.pipeline_cache', workers=workers,
+            target_mode=target_mode)
     manifest = train_specialists(parts, output, branch_labels=branch_labels,
         prepare_only=prepare_only, train_text=train_text, bert_epochs=bert_epochs,
-        bert_model_name=bert_model_name, preprocessing=preprocessing)
+        bert_model_name=bert_model_name, preprocessing=preprocessing, target_mode=target_mode)
     print('Specialists:', {name: c['status'] for name, c in manifest['branches'].items()}, flush=True)
     return manifest

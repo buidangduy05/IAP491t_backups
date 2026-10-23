@@ -29,6 +29,7 @@ from sklearn.neural_network import MLPClassifier
 from xgboost import XGBClassifier
 
 from load_data import (load_data_phishing, load_data_enron, load_data_spamassassin,
+                       load_data_epvme, load_data_phishing_pot, record_dataset_root_files,
                        reset_source_stats, SOURCE_COUNTS, SOURCE_ERRORS, SOURCE_ROW_ISSUES)
 from preprocess import (FEATURE_NAMES, cleanText, remove_stopwords, tokenize_text,
                         extract_engineered_features, deduplicate_emails,
@@ -39,6 +40,15 @@ from evaluate import positive_scores, select_threshold, validation_rank, file_di
 BASE_DIR = Path(__file__).resolve().parent
 SEED = 42
 TARGET_MODE = 'phishing'  # 'broad': include known spam/mixed positives; never unknown labels.
+# Two-stage filter: stage 1 = 'broad' (malicious vs legitimate); stage 2 =
+# 'phishing_vs_spam', trained only on sources that name the kind. spam_or_phishing
+# CSVs (TREC/CEAS/Ling/Enron.csv) and synthetic EPVME do not, so stage 2 omits them.
+TARGET_MODES = ('phishing', 'broad', 'phishing_vs_spam')
+STAGE2_CLASSES = {'phishing': 1, 'spam': 0}
+POSITIVE_LABELS = {'phishing': 'phishing', 'broad': 'phishing/spam/unspecified-positive',
+                   'phishing_vs_spam': 'phishing (negative class: spam)'}
+# EPVME spoofing/XSS/signature attacks count as positives in phishing mode.
+INCLUDE_SYNTHETIC_MALICIOUS = True
 MIN_VALIDATION_PRECISION = 0.90  # Target on validation, not a production guarantee.
 BALANCED_MODE = 0  # 1: downsample TRAIN only; validation/test keep their distribution.
 TRAIN_ALL_MODELS = True  # Train all 10 classifiers; tune XGBoost, MLP and Random Forest.
@@ -72,6 +82,9 @@ def load_training_emails(output, dataset_dir=None):
         phishing = load_data_phishing(pd.DataFrame(), dataset / 'phishing')
         phishing, legitimate = load_data_spamassassin(phishing, pd.DataFrame(), dataset / 'spamassassin')
         legitimate = load_data_enron(legitimate, 0, enron_dir=dataset / 'enron')
+        phishing = load_data_epvme(phishing, dataset / 'EPVME_extracted')
+        phishing = load_data_phishing_pot(phishing, dataset / 'phishing_pot')
+        record_dataset_root_files(dataset)
     finally:
         load_data.ACTIVE_AUDIT = None
         summary = audit.finish(SOURCE_COUNTS, SOURCE_ERRORS, load_data.SOURCE_PROVENANCE)
@@ -86,10 +99,10 @@ def load_training_emails(output, dataset_dir=None):
     return data
 
 
-def select_label_scope(data, target_mode, output):
+def select_label_scope(data, target_mode, output, include_synthetic=INCLUDE_SYNTHETIC_MALICIOUS):
     """Preserve publisher/source labels. Never infer a phishing label from text."""
-    if target_mode not in {'phishing', 'broad'}:
-        raise ValueError('TARGET_MODE must be phishing or broad')
+    if target_mode not in TARGET_MODES:
+        raise ValueError(f'TARGET_MODE must be one of {TARGET_MODES}')
     data = data.copy()
     for col, default in (('Source', 'unknown'), ('Location', ''), ('OriginalLabel', 'unknown')):
         if col not in data:
@@ -102,15 +115,28 @@ def select_label_scope(data, target_mode, output):
     if 'RecordId' not in data:
         from dataset_audit import record_id
         data['RecordId'] = [record_id(f'{loc}:input:{i}') for i, loc in enumerate(data.Location)]
-    data, audit = deduplicate_emails(data, report_path=output / 'label_conflicts.csv', return_audit=True)
-    keep = (data.Class == 0) | (data.LabelKind == 'phishing') if target_mode == 'phishing' else np.ones(len(data), dtype=bool)
     columns = ['Source', 'Location', 'OriginalLabel', 'LabelKind', 'Class', '_dedup_key']
-    data.loc[~keep, columns].to_csv(output / 'label_scope_excluded.csv', index=False)
-    audit.loc[audit.RecordId.isin(data.loc[~keep, 'RecordId']), 'Disposition'] = 'outside_label_scope'
+    outside_ids = set()
+    if target_mode == 'phishing_vs_spam':
+        # Relabel BEFORE dedup: the same content labelled spam and phishing is a conflict,
+        # not a duplicate. Rows of other kinds get no stage-2 label and leave the scope.
+        outside = data.Class.notna() & ~data.LabelKind.isin(STAGE2_CLASSES)
+        data.loc[outside, [c for c in columns if c in data]].to_csv(output / 'label_scope_excluded.csv', index=False)
+        outside_ids = set(data.loc[outside, 'RecordId'])
+        data['Class'] = data.LabelKind.map(STAGE2_CLASSES)
+    data, audit = deduplicate_emails(data, report_path=output / 'label_conflicts.csv', return_audit=True)
+    positive_kinds = {'phishing', 'malicious_synthetic'} if include_synthetic else {'phishing'}
+    keep = ((data.Class == 0) | data.LabelKind.isin(positive_kinds) if target_mode == 'phishing'
+            else np.ones(len(data), dtype=bool))
+    if target_mode != 'phishing_vs_spam':
+        data.loc[~keep, columns].to_csv(output / 'label_scope_excluded.csv', index=False)
+    audit.loc[audit.RecordId.isin(data.loc[~keep, 'RecordId']) | audit.RecordId.isin(outside_ids),
+              'Disposition'] = 'outside_label_scope'
     audit.to_csv(output / 'training_dispositions.csv', index=False)
     save_json(output / 'selection_summary.json', {'rows_in': len(audit),
               'dispositions': {str(k): int(v) for k, v in audit.Disposition.value_counts().items()},
-              'rows_selected': int(np.sum(keep)), 'target_mode': target_mode})
+              'rows_selected': int(np.sum(keep)), 'target_mode': target_mode,
+              'include_synthetic_malicious': bool(include_synthetic)})
     if int(audit.Disposition.eq('selected').sum()) != int(np.sum(keep)):
         raise RuntimeError('Selection ledger does not reconcile')
     print(f'Target={target_mode}: retaining {int(np.sum(keep))}/{len(data)} unique labelled emails', flush=True)
@@ -410,7 +436,7 @@ def training(data=None, output_dir=BASE_DIR, candidates=None, epochs=DOC2VEC_EPO
             bert_model_name, batch_size=BERT_BATCH_SIZE,
             max_length=BERT_MAX_LENGTH, stride=BERT_STRIDE)
         bert.model.config.email_positive_label = (
-            'phishing' if target_mode == 'phishing' else 'phishing/spam/unspecified-positive')
+            POSITIVE_LABELS[target_mode])
         print(f'BERT initialized on {bert.device}; pretrained weights will be fine-tuned.', flush=True)
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
     model_dir = output / 'dumped_models' / 'classification'; model_dir.mkdir(parents=True, exist_ok=True)
@@ -487,7 +513,7 @@ def training(data=None, output_dir=BASE_DIR, candidates=None, epochs=DOC2VEC_EPO
         parameters['BERT'] = settings['bert']
     save_json(output / 'selected_parameters.json', parameters)
     manifest = {'status': 'complete', 'schema_version': 2, 'target_mode': target_mode,
-                'positive_label': 'phishing' if target_mode == 'phishing' else 'phishing/spam/unspecified-positive',
+                'positive_label': POSITIVE_LABELS[target_mode],
                 'selected_model': selected_name, 'models': configurations, 'settings': settings,
                 'seed': SEED, 'python': platform.python_version(), 'sklearn': sklearn.__version__,
                 'test_used_for_selection': False,
@@ -503,6 +529,8 @@ if __name__ == '__main__':
     from zoneinfo import ZoneInfo
     parser = argparse.ArgumentParser(description='Audited email pipeline and five specialist branches')
     parser.add_argument('--mode', choices=('specialists', 'baseline'), default='specialists')
+    parser.add_argument('--target-mode', choices=TARGET_MODES, default=TARGET_MODE,
+                        help="Two-stage filter: 'broad' trains stage 1, 'phishing_vs_spam' stage 2")
     parser.add_argument('--output', type=Path)
     parser.add_argument('--dataset-dir', type=Path)
     parser.add_argument('--cache-dir', type=Path)
@@ -522,7 +550,7 @@ if __name__ == '__main__':
         print('Audit:', summary['status'], '; emails loaded:', summary['counts'].get('emails_loaded', 0))
     elif args.mode == 'specialists':
         from specialists import run_specialists
-        run_specialists(output, dataset_dir=args.dataset_dir, cache_dir=args.cache_dir,
+        run_specialists(output, dataset_dir=args.dataset_dir, cache_dir=args.cache_dir, target_mode=args.target_mode,
                         workers=args.workers, branch_labels=args.branch_labels,
                         prepare_only=args.prepare_only, train_text=not args.skip_text_training,
                         bert_epochs=args.bert_epochs, bert_model_name=args.bert_model, resume=args.resume)
@@ -531,5 +559,5 @@ if __name__ == '__main__':
             parser.error('Preparation/resume/dataset/cache/worker options apply to specialist mode')
         if output.exists() and any(output.iterdir()):
             parser.error('Choose a new output directory')
-        training(output_dir=output, train_bert=not args.skip_text_training,
+        training(output_dir=output, train_bert=not args.skip_text_training, target_mode=args.target_mode,
                  bert_epochs=args.bert_epochs, bert_model_name=args.bert_model)

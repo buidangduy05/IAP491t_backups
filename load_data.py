@@ -5,16 +5,20 @@ Spam corpora do not distinguish phishing from other spam. Unknown numeric
 conventions stay unlabelled; content-based predictions never become labels.
 
 Sources: Dataset/phishing (Nazario mbox + curated CSVs), Dataset/spamassassin,
-Dataset/enron, Dataset/EPVME_extracted (synthetic malicious, load_data_epvme).
+Dataset/enron, Dataset/EPVME_extracted (synthetic malicious, load_data_epvme),
+Dataset/phishing_pot (honeypot phishing, load_data_phishing_pot).
 Files directly in Dataset/ are accounted by record_dataset_root_files():
 df.csv is excluded by policy; StealthPhisher2025.csv is a URL corpus for
 load_url_dataset(), not email.
 """
 import csv
+import errno
+import functools
 import hashlib
 import mailbox
 import os
 import re
+import subprocess
 import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -48,6 +52,16 @@ KIND_CLASSES = {"legitimate": 0, "phishing": 1, "spam": 1, "spam_or_phishing": 1
 # envelope MAIL FROM, so these files are never split as mbox.
 EPVME_REFERENCE = "https://github.com/sunknighteric/EPVME-Dataset"
 EPVME_DIRNAMES = {"epvme_extracted", "epvme"}
+# Phishing Pot: real phishing received by honeypot addresses, CC BY-NC 4.0
+# (non-commercial, attribution required). Only email/*.eml are samples; the clone
+# also holds .git, docs and images. Record the commit: the corpus keeps growing.
+PHISHING_POT_REFERENCE = "https://github.com/rf-peixoto/phishing_pot"
+PHISHING_POT_DIRNAME = "phishing_pot"
+SINGLE_MESSAGE_DIRNAMES = EPVME_DIRNAMES | {PHISHING_POT_DIRNAME}
+# Windows reports a file that antivirus blocked or quarantined as WinError 225/226;
+# Python's open() surfaces that as errno EINVAL without winerror. Real malware samples
+# (EPVME, Phishing Pot) trigger it; there it is recorded as a loss, not a read error.
+ANTIVIRUS_WINERRORS = {225, 226}
 # Files in the dataset root that are recorded but deliberately not loaded as email.
 EXCLUDED_DATASET_FILES = {
     "df.csv": ("Undocumented numeric labels 0/1/2; pre-cleaned lowercase text without "
@@ -325,11 +339,17 @@ def _raw_source_label(path, root, default_label, classify, source_kind, discover
         default_label = None
         classify = corpus == "spamassassin"
         source_kind = ("phishing" if corpus == "phishing" else
-                       "epvme" if corpus in EPVME_DIRNAMES else None)
+                       "epvme" if corpus in EPVME_DIRNAMES else
+                       "phishing_pot" if corpus == PHISHING_POT_DIRNAME else None)
         if corpus == "enron" and any(p.lower() == "maildir" for p in parts[1:-1]):
             return 0, "legitimate", "enron_maildir_assumption; not individually reviewed", source
     if source_kind == "epvme":
         return 1, "malicious_synthetic", "epvme_publisher_all_malicious; " + EPVME_REFERENCE, "EPVME"
+    if source_kind == "phishing_pot":
+        # Samples live in email/*.eml; README images, .github and CITATION are not email.
+        if os.path.basename(path).lower().endswith(".eml") and Path(path).parent.name.lower() == "email":
+            return 1, "phishing", _phishing_pot_basis(path), "phishing_pot"
+        return None, "unknown", "phishing_pot_non_sample_file", "phishing_pot"
     if classify:
         label = _classify_spamassassin_label(os.path.dirname(path), root)
         if label is not None:
@@ -359,7 +379,68 @@ def _prefetch_raw(path, single_message=False):
                 return None, None, 'stream_mbox'
             return prefix + handle.read(), None, None
     except OSError as exc:
-        return None, type(exc).__name__, str(exc)
+        blocked = (getattr(exc, "winerror", None) in ANTIVIRUS_WINERRORS
+                   or (os.name == "nt" and exc.errno == errno.EINVAL))
+        return None, "AntivirusBlocked" if blocked else type(exc).__name__, str(exc)
+
+
+def _git_commit(repo):
+    """Checked-out commit read from .git without running git; None if unavailable."""
+    git = Path(repo) / ".git"
+    try:
+        head = (git / "HEAD").read_text(encoding="utf-8").strip()
+        if not head.startswith("ref: "):
+            return head
+        ref = head[5:]
+        if (git / ref).is_file():
+            return (git / ref).read_text(encoding="utf-8").strip()
+        for line in (git / "packed-refs").read_text(encoding="utf-8").splitlines():
+            if line.endswith(" " + ref):
+                return line.split()[0]
+    except OSError:
+        pass
+    return None
+
+
+def _phishing_pot_basis(path):
+    repo = next((p for p in Path(path).parents if p.name.lower() == PHISHING_POT_DIRNAME), None)
+    return _phishing_pot_basis_for(os.fspath(repo) if repo else "")
+
+
+@functools.lru_cache(maxsize=8)
+def _phishing_pot_basis_for(repo):
+    commit = _git_commit(repo) if repo else None
+    return (f"phishing_pot_publisher_states_phishing (honeypot; may include spam); CC BY-NC 4.0; "
+            f"commit={commit or 'unknown'}; {PHISHING_POT_REFERENCE}")
+
+
+def record_phishing_pot_checkout(pot_dir):
+    """Provenance of the Phishing Pot clone: commit and tracked samples absent on disk.
+
+    Antivirus quarantine deletes some samples after checkout; they are listed, not guessed.
+    """
+    pot_dir = Path(pot_dir)
+    if not (pot_dir / "email").is_dir():
+        return
+    present = {p.name for p in (pot_dir / "email").iterdir() if p.is_file()}
+    tracked = None
+    # Without its own .git, "git -C" would silently answer for the enclosing project repo.
+    if (pot_dir / ".git").exists():
+        try:
+            listed = subprocess.run(["git", "-C", os.fspath(pot_dir), "ls-files", "-z", "email"],
+                                    capture_output=True, check=True, timeout=120).stdout
+            tracked = {Path(name).name for name in listed.decode("utf-8").split("\0") if name}
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            tracked = None
+    missing = sorted(tracked - present) if tracked is not None else None
+    SOURCE_COUNTS["phishing_pot_missing_from_checkout"] += len(missing or ())
+    SOURCE_PROVENANCE[os.fspath(pot_dir)] = {
+        "status": "corpus", "reference": PHISHING_POT_REFERENCE, "license": "CC BY-NC 4.0",
+        "commit": _git_commit(pot_dir), "samples_present": len(present),
+        "samples_tracked": None if tracked is None else len(tracked),
+        "missing_from_checkout": missing}
+    if missing:
+        print(f"  {pot_dir}: {len(missing)} tracked samples missing on disk (antivirus quarantine?)")
 
 
 def _epvme_attack_family(message):
@@ -390,7 +471,7 @@ def _epvme_attack_family(message):
 
 
 def _iter_rows(root_dir, default_label=None, classify=False, optional=False,
-               source_kind=None, discover=False, single_message=False):
+               source_kind=None, discover=False, single_message=False, antivirus_ok=False):
     root = _win_long_path(root_dir)
     if not os.path.isdir(root):
         print(f"  Missing dataset directory: {root_dir}")
@@ -402,10 +483,13 @@ def _iter_rows(root_dir, default_label=None, classify=False, optional=False,
         print(f"  Directory read failed: {exc}")
     total = loaded = 0
     def keep_whole(path):
-        return single_message or (discover and os.path.relpath(path, root).split(os.sep)[0].lower() in EPVME_DIRNAMES)
+        return single_message or (discover and os.path.relpath(path, root).split(os.sep)[0].lower()
+                                  in SINGLE_MESSAGE_DIRNAMES)
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as readers:
         for directory, dirs, files in os.walk(root, onerror=onerror):
-            dirs[:] = sorted(dirs)  # Hidden directories can contain emails too.
+            if ".git" in dirs:  # Version-control objects of a cloned corpus, never email.
+                SOURCE_COUNTS["vcs_directories_skipped"] += 1
+            dirs[:] = sorted(d for d in dirs if d != ".git")  # Other hidden directories can contain emails.
             for dirname in list(dirs):
                 linked = os.path.join(directory, dirname)
                 if os.path.islink(linked):
@@ -423,6 +507,16 @@ def _iter_rows(root_dir, default_label=None, classify=False, optional=False,
                     path = os.path.join(directory, name)
                     if low in EXCLUDED_DATASET_FILES or low in URL_DATASET_FILES:
                         _record_non_email_file(path)
+                        continue
+                    in_pot = source_kind == "phishing_pot" or (
+                        discover and os.path.relpath(path, root).split(os.sep)[0].lower() == PHISHING_POT_DIRNAME)
+                    if in_pot and not low.endswith(".eml"):
+                        # email/sample-3989.csv is a leaked list of personal data, not a sample.
+                        reason = "Phishing Pot sample folder holds only .eml; other files are not read"
+                        SOURCE_COUNTS["files_excluded_by_policy"] += 1
+                        SOURCE_PROVENANCE[path] = {"status": "excluded", "reason": reason}
+                        if ACTIVE_AUDIT is not None:
+                            ACTIVE_AUDIT.file(path, "excluded", reason)
                         continue
                     if ACTIVE_AUDIT is not None:
                         ACTIVE_AUDIT.file(path, 'reading')
@@ -450,6 +544,12 @@ def _iter_rows(root_dir, default_label=None, classify=False, optional=False,
                                 SOURCE_COUNTS["spam_excluded"] += 1
                                 # Still enumerate and account for every message in this file.
                             content, error, detail = payload
+                            if error and antivirus_ok and error in ("AntivirusBlocked", "FileNotFoundError"):
+                                SOURCE_COUNTS["files_blocked_by_antivirus"] += 1
+                                if ACTIVE_AUDIT is not None:
+                                    ACTIVE_AUDIT.file(path, 'antivirus_blocked', detail)
+                                print(f"  Blocked or removed by antivirus, not loaded: {path}")
+                                continue
                             if error:
                                 raise OSError(detail)
                             if detail == 'stream_mbox':
@@ -541,7 +641,16 @@ def load_data_epvme(data, epvme_dir=None):
     """EPVME synthetic attacks; an absent folder is not an error."""
     return _append_rows(data, _iter_rows(
         epvme_dir or DATASET_DIR / "EPVME_extracted", source_kind="epvme",
-        optional=True, single_message=True))
+        optional=True, single_message=True, antivirus_ok=True))
+
+
+def load_data_phishing_pot(data, pot_dir=None):
+    """Phishing Pot honeypot samples (email/*.eml only); an absent folder is not an error."""
+    pot_dir = Path(pot_dir or DATASET_DIR / PHISHING_POT_DIRNAME)
+    record_phishing_pot_checkout(pot_dir)
+    return _append_rows(data, _iter_rows(
+        pot_dir / "email", source_kind="phishing_pot", optional=True,
+        single_message=True, antivirus_ok=True))
 
 
 def load_url_dataset(path=None):
@@ -598,7 +707,10 @@ def audit_dataset(dataset_dir, output):
                    (dataset / 'spamassassin', {'classify': True, 'optional': True}),
                    (dataset / 'enron', {'default_label': 0}),
                    (dataset / 'EPVME_extracted', {'source_kind': 'epvme', 'optional': True,
-                                                  'single_message': True}))
+                                                  'single_message': True, 'antivirus_ok': True}),
+                   (dataset / PHISHING_POT_DIRNAME / 'email', {'source_kind': 'phishing_pot', 'optional': True,
+                                                               'single_message': True, 'antivirus_ok': True}))
+        record_phishing_pot_checkout(dataset / PHISHING_POT_DIRNAME)
         for root, settings in sources:
             for _ in _iter_rows(root, **settings):
                 pass
