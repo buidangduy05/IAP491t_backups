@@ -12,3 +12,11 @@ matplotlib
 tqdm
 requests
 bs4
+
+# BERT semantic classifier. For NVIDIA GPUs install a matching CUDA torch wheel.
+torch>=2.6,<3
+transformers>=4.46,<5
+safetensors>=0.4
+
+# Static macro analysis for attachment features (olevba; never executes code).
+oletools>=0.60,<0.61
