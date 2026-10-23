@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import importlib.util
 import json
 import mailbox
 from pathlib import Path
@@ -116,7 +117,8 @@ class PipelineTests(unittest.TestCase):
         with PreprocessingCache(self.root / 'other-cache', workers=2, batch_size=5) as cache:
             parallel = cache.prepare(frame, 'identity', self.root)
             parallel = cache.prepare(parallel, 'features', self.root)
-        for field in ('RecordId', '_features', '_dedup_key', '_semantic_text', '_clean_text', '_html_features'):
+        for field in ('RecordId', '_features', '_dedup_key', '_semantic_text', '_clean_text', '_html_features',
+                      '_message_security'):
             self.assertEqual(sequential[field].to_list(), parallel[field].to_list())
         with PreprocessingCache(self.root / 'cache', workers=1) as cache:
             warm = cache.prepare(frame, 'features', self.root)
@@ -192,6 +194,9 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(manifest['branches']['attachment']['status'], 'awaiting_labels')
         self.assertEqual(manifest['branches']['header']['status'], 'trained')
         self.assertEqual(manifest['branches']['url']['status'], 'trained')
+        self.assertEqual(manifest['target_mode'], 'phishing')
+        by_source = pd.read_csv(self.root / 'specialist_evaluation_by_source.csv')
+        self.assertEqual(set(by_source.Branch), {'header', 'url'})
         recomputed = evaluate_specialists(self.root)
         self.assertEqual(set(recomputed.Branch), {'header', 'url'})
         original = pd.read_csv(self.root / 'specialist_evaluation.csv', float_precision='round_trip')
@@ -232,6 +237,59 @@ class PipelineTests(unittest.TestCase):
         resumed = run_specialists(self.root / 'resumed', resume=self.root, prepare_only=True)
         self.assertEqual(resumed['status'], 'partial')
 
+    def test_two_stage_filter_uses_only_named_spam_and_phishing_for_stage_two(self):
+        from predict_specialists import EmailSpecialists, TwoStageFilter, two_stage_verdict
+        rows = []
+        for index in range(120):
+            kind = ('phishing', 'spam')[index % 2]
+            location = f'stage2:message:{index}'
+            rows.append({'Text': email_bytes(index, kind == 'phishing'), 'Class': 1, 'Source': f'{kind}_source',
+                         'Location': location, 'LabelKind': kind, 'OriginalLabel': '1',
+                         'LabelBasis': 'synthetic test fixture', 'RecordId': record_id(location)})
+        extra = [('legitimate', 0, email_bytes(500)), ('spam_or_phishing', 1, email_bytes(501, True)),
+                 ('malicious_synthetic', 1, email_bytes(502, True)),
+                 ('phishing', 1, email_bytes(503, True)), ('spam', 1, email_bytes(503, True))]  # same content, two kinds
+        for number, (kind, label, raw) in enumerate(extra):
+            location = f'stage2:extra:{number}'
+            rows.append({'Text': raw, 'Class': label, 'Source': 'extra', 'Location': location, 'LabelKind': kind,
+                         'OriginalLabel': str(label), 'LabelBasis': 'synthetic test fixture',
+                         'RecordId': record_id(location)})
+        frame = pd.DataFrame(rows)
+        scope = self.root / 'scope'; scope.mkdir()
+        selected = select_label_scope(frame, 'phishing_vs_spam', scope)
+        self.assertEqual(selected.groupby('LabelKind').Class.unique().map(list).to_dict(),
+                         {'phishing': [1], 'spam': [0]})
+        self.assertEqual(len(selected), 120)
+        audit = pd.read_csv(scope / 'training_dispositions.csv').set_index('RecordId').Disposition
+        dispositions = {kind: audit[record_id(f'stage2:extra:{n}')] for n, (kind, _, _) in enumerate(extra[:3])}
+        self.assertEqual(set(dispositions.values()), {'outside_label_scope'})
+        self.assertEqual(audit[record_id('stage2:extra:3')], 'conflicting_labels')
+        self.assertEqual(len(pd.read_csv(scope / 'label_scope_excluded.csv')), 3)
+
+        stage2 = self.root / 'stage2'; stage2.mkdir()
+        parts, settings = prepare_specialists(frame, stage2, self.root / 'cache', workers=1, target_mode='phishing_vs_spam')
+        manifest = train_specialists(parts, stage2, preprocessing=settings, train_text=False, target_mode='phishing_vs_spam')
+        self.assertEqual((manifest['target_mode'], manifest['branches']['header']['status']), ('phishing_vs_spam', 'trained'))
+        stage1 = self.root / 'stage1'; stage1.mkdir()
+        parts, settings = prepare_specialists(training_frame(120), stage1, self.root / 'cache', workers=1, target_mode='broad')
+        train_specialists(parts, stage1, preprocessing=settings, train_text=False, target_mode='broad')
+        with self.assertRaises(ValueError):  # stages swapped
+            TwoStageFilter(stage2, stage1)
+        result = TwoStageFilter(stage1, stage2).assess(email_bytes(1001, True))
+        self.assertEqual(result['stage1']['target_mode'], 'broad')
+        self.assertEqual(result['stage2'] is None, not result['stage1']['phishing_evidence'])
+        self.assertEqual(result['verdict'], two_stage_verdict(result['stage1'], result['stage2']))
+        with self.assertRaises(RuntimeError):  # a stage-2 preparation cannot be resumed as stage 1
+            run_specialists(self.root / 'resumed', resume=stage2, prepare_only=True, target_mode='broad')
+
+        assessed = {'status': 'assessed', 'target': 'email_phishing'}
+        flagged = {'phishing_evidence': ['url'], 'unassessed_branches': [], 'branches': {}}
+        self.assertEqual(two_stage_verdict({'phishing_evidence': [], 'unassessed_branches': []}), 'not_flagged')
+        self.assertEqual(two_stage_verdict(flagged, {'phishing_evidence': [], 'branches': {'url': assessed}}), 'spam')
+        self.assertEqual(two_stage_verdict(flagged, {'phishing_evidence': ['url'], 'branches': {'url': assessed}}), 'phishing')
+        self.assertEqual(two_stage_verdict(flagged, {'phishing_evidence': [], 'branches': {
+            'url': {'status': 'no_applicable_input', 'target': 'email_phishing'}}}), 'malicious_unclassified')
+
     def test_baseline_preparation_still_has_all_rows_and_original_dimensions(self):
         frame = training_frame(60)
         arrays, _, _, settings = prepare_data(frame, self.root, epochs=2,
@@ -240,6 +298,307 @@ class PipelineTests(unittest.TestCase):
         for X, y in arrays.values():
             self.assertEqual(X.shape, (len(y), 153))
             self.assertTrue(np.isfinite(X).all())
+
+    def test_epvme_keeps_envelope_attack_and_separates_it_from_copied_original(self):
+        from preprocess import (extract_message_security_features, prepare_semantic_text,
+                                _parse_email, _header_attack_identity)
+        original = email_bytes(5, True)
+        # EPVME stores the attacker's MAIL FROM as a leading "From " line.
+        spoofed = b'From <a@example.org,,test@attack.com>\n' + original
+        templated = original.replace(b'Subject: Notice 5', b'Subject: MIME Attack Sample')
+        multiple = original.replace(b'From: ', b'From: <boss@example.org>\nFrom: ', 1)
+        dataset = self.root / 'Dataset'
+        (dataset / 'EPVME_extracted' / '1').mkdir(parents=True)
+        (dataset / 'enron').mkdir()
+        (dataset / 'phishing').mkdir()
+        for name, raw in (('a.eml', spoofed), ('b.eml', templated), ('c.eml', multiple)):
+            (dataset / 'EPVME_extracted' / '1' / name).write_bytes(raw)
+        (dataset / 'enron' / 'mail').write_bytes(email_bytes(6))
+        data = load_training_emails(self.root / 'load', dataset)
+        epvme = data[data.Source == 'EPVME']
+        epvme = epvme.set_index(epvme.Location.map(lambda loc: Path(loc.split(':message:')[0]).name))
+        self.assertEqual(len(epvme), 3)
+        self.assertEqual(set(epvme.LabelKind), {'malicious_synthetic'})
+        self.assertEqual(set(epvme.Class), {1})
+        self.assertTrue(epvme.Text.iloc[0].startswith(b'From <'))  # not split as an mbox
+        families = {name[:1]: basis.split('attack_family=')[1].split()[0] for name, basis in epvme.LabelBasis.items()}
+        self.assertEqual(families, {'a': 'mail_from_inconsistency', 'b': 'mime_wrapping', 'c': 'multiple_from'})
+        security = extract_message_security_features(_parse_email(spoofed))
+        self.assertEqual(security['hdr_envelope_syntax_anomaly'], 1)
+        self.assertEqual(security['hdr_return_path_domain_mismatch'], 1)
+        self.assertEqual(extract_message_security_features(_parse_email(multiple))['hdr_from_header_count'], 2)
+        self.assertIsNone(_header_attack_identity(_parse_email(original)))
+        self.assertNotEqual(compute_dedup_key(spoofed), compute_dedup_key(original))
+        self.assertEqual(compute_dedup_key(templated.replace(b'MIME Attack Sample', b'Notice 5')),
+                         compute_dedup_key(original))
+        self.assertNotIn('Attack Sample', prepare_semantic_text(templated))
+        self.assertNotIn('attack', cleanText(templated).split())
+        (self.root / 'scope').mkdir()
+        selected = select_label_scope(data, 'phishing', self.root / 'scope', include_synthetic=True)
+        self.assertEqual(selected.Class.value_counts().to_dict(), {1: 3, 0: 1})
+        with self.assertRaises(ValueError):  # Without EPVME no positive label remains.
+            select_label_scope(data, 'phishing', self.root / 'scope', include_synthetic=False)
+        summary = json.loads((self.root / 'load' / 'load_summary.json').read_text())
+        self.assertEqual(summary['status'], 'complete')
+
+    def test_non_email_files_in_dataset_root_are_recorded_not_loaded(self):
+        dataset = self.root / 'Dataset'
+        (dataset / 'enron').mkdir(parents=True)
+        (dataset / 'phishing').mkdir()
+        (dataset / 'enron' / 'mail').write_bytes(email_bytes(1))
+        (dataset / 'df.csv').write_text('label,text\n0,hello world\n2,buy now\n')
+        (dataset / 'StealthPhisher2025.csv').write_text('URL,Label\nhttps://a.example,Legitimate\n')
+        (dataset / 'notes.txt').write_text('unregistered')
+        data = load_training_emails(self.root / 'load', dataset)
+        self.assertEqual(len(data), 1)
+        summary = json.loads((self.root / 'load' / 'load_summary.json').read_text())
+        self.assertEqual(summary['status'], 'complete')
+        self.assertEqual(summary['file_outcomes'], {'complete': 1, 'excluded': 1,
+                                                    'url_dataset': 1, 'unregistered': 1})
+        self.assertEqual(summary['counts']['files_excluded_by_policy'], 1)
+
+    def test_phishing_pot_loads_samples_only_and_masks_the_redaction_placeholder(self):
+        from preprocess import prepare_semantic_text, extract_link_features
+        dataset = self.root / 'Dataset'
+        pot = dataset / 'phishing_pot'
+        for folder in ('email', 'img', '.github', '.git/refs/heads', '.git/objects/ab'):
+            (pot / folder).mkdir(parents=True)
+        commit = 'c0ffee' * 6 + 'abcd'
+        (pot / '.git' / 'HEAD').write_text('ref: refs/heads/main\n')
+        (pot / '.git' / 'refs' / 'heads' / 'main').write_text(commit + '\n')
+        (pot / '.git' / 'objects' / 'ab' / 'cdef').write_bytes(b'From: not an email\n\nobject')
+        (pot / 'README.md').write_text('# Phishing Pot')
+        (pot / 'CITATION.cff').write_text('cff-version: 1.2.0')
+        (pot / 'img' / 'logo.png').write_bytes(b'\x89PNG\r\n')
+        msg = EmailMessage()
+        msg['From'] = 'Mail Admin <admin@mailbox-quota.example>'
+        msg['To'] = 'phishing@pot'
+        msg['Subject'] = 'phishing@pot: mailbox full'
+        msg.set_content('Hello phishing@potSie, ref 2020-phishing@pot6527. Your mailbox is full. '
+                        'Restore it at https://quota.example/r?u=phishing%40pot')
+        raw = msg.as_bytes()
+        (pot / 'email' / 'sample-1.eml').write_bytes(raw)
+        (pot / 'email' / 'sample-2.eml').write_bytes(b'From attacker@example.net Mon Jan  1 00:00:00 2026\n' + raw)
+        (pot / 'email' / 'sample-3.eml').write_bytes(raw)
+        (pot / 'email' / 'sample-4.csv').write_text('Email,Name\nperson@example.org,Person\n')  # not a sample
+        (dataset / 'enron').mkdir()
+        (dataset / 'phishing').mkdir()
+        (dataset / 'enron' / 'mail').write_bytes(email_bytes(6))
+        real_prefetch = load_data._prefetch_raw
+
+        def quarantined(path, single_message=False):  # Defender blocks real malware samples on open.
+            if path.endswith('sample-3.eml'):
+                return None, 'AntivirusBlocked', '[WinError 225] contains a virus'
+            return real_prefetch(path, single_message)
+
+        with patch('load_data._prefetch_raw', side_effect=quarantined):
+            data = load_training_emails(self.root / 'load', dataset)
+        pot_rows = data[data.Source == 'phishing_pot']
+        self.assertEqual(len(pot_rows), 2)
+        self.assertEqual(set(pot_rows.LabelKind), {'phishing'})
+        self.assertTrue(all(f'commit={commit}' in basis for basis in pot_rows.LabelBasis))
+        self.assertTrue(any(text.startswith(b'From attacker@') for text in pot_rows.Text))  # not split as mbox
+        summary = json.loads((self.root / 'load' / 'load_summary.json').read_text())
+        self.assertEqual(summary['status'], 'complete')
+        self.assertEqual(summary['counts']['files_blocked_by_antivirus'], 1)
+        self.assertEqual(summary['counts']['files_excluded_by_policy'], 1)
+        self.assertEqual(len(data), 3)  # 2 Phishing Pot samples + 1 Enron; nothing from .git/img/docs
+        semantic = prepare_semantic_text(raw)
+        self.assertNotIn('phishing', semantic.lower())
+        self.assertIn('Your mailbox is full', semantic)
+        self.assertFalse({'phishing', 'pot'} & set(cleanText(raw).split()))
+        # The personalised link is still evidence: the URL carries the recipient address.
+        self.assertEqual(extract_link_features(raw)['link_recipient_address_count'], 1)
+        # Python's open() reports a Defender-blocked file as EINVAL without winerror.
+        import errno, os
+        with patch('load_data.open', side_effect=OSError(errno.EINVAL, 'Invalid argument'), create=True):
+            error = load_data._prefetch_raw(str(pot / 'email' / 'sample-1.eml'), True)[1]
+        self.assertEqual(error, 'AntivirusBlocked' if os.name == 'nt' else 'OSError')
+
+    def test_url_dataset_labels_conflicts_and_shared_lexical_features(self):
+        from preprocess import (extract_url_lexical_features, URL_LEXICAL_FEATURE_NAMES,
+                                URL_HOST_FEATURE_NAMES, url_group_key, extract_email_urls)
+        self.assertTrue(set(URL_HOST_FEATURE_NAMES) < set(URL_LEXICAL_FEATURE_NAMES))
+        path = self.root / 'StealthPhisher2025.csv'
+        pd.DataFrame({'URL': ['https://www.example.com', 'http://login-verify.example.tk/a/b?x=1',
+                              'https://dup.example.org', 'https://dup.example.org', 'https://odd.example'],
+                      'Label': ['Legitimate', 'Phishing', 'Phishing', 'Legitimate', 'Maybe'],
+                      'HasSSL': [1, 0, 1, 1, 1]}).to_csv(path, index=False)
+        urls = load_data.load_url_dataset(path)
+        self.assertEqual(urls.Class.iloc[:2].to_list(), [0, 1])
+        self.assertEqual(urls.LabelKind.iloc[2:].to_list(), ['conflicting_labels', 'conflicting_labels', 'unknown'])
+        self.assertTrue(urls.Class.iloc[2:].isna().all())
+        features = extract_url_lexical_features(urls.URL.iloc[1])
+        self.assertEqual(len(features), len(URL_LEXICAL_FEATURE_NAMES))
+        values = dict(zip(URL_LEXICAL_FEATURE_NAMES, features))
+        self.assertEqual((values['url_suspicious_tld'], values['url_path_depth'], values['url_subdomain_count']), (1, 2, 1))
+        # Scheme is not a feature: corpus legitimate URLs are all https.
+        self.assertEqual(extract_url_lexical_features('http://x.example/p'), extract_url_lexical_features('https://x.example/p'))
+        self.assertEqual(url_group_key('https://a.b.example.co.uk/x'), 'example.co.uk')
+        self.assertEqual(extract_email_urls(email_bytes(3)), ['https://example.invalid/3'])
+
+    def test_mixed_fonts_scripts_and_invisible_characters_are_normalized(self):
+        from preprocess import normalize_obfuscated_text
+        cases = {
+            'Reset your pаsswогd at UРЅ': 'Reset your password at UPS',   # Cyrillic homoglyphs
+            'Verify 𝐏𝐚𝐲𝐏𝐚𝐥 now': 'Verify PayPal now',                   # math bold "font"
+            'Ｐａｙ now': 'Pay now',                                       # fullwidth
+            'ᴘᴀʏᴘᴀʟ alert': 'paypal alert',                               # small caps
+            'Pa​ss­word': 'Password',                           # invisible splitters
+            'Login to P a y P a l': 'Login to PayPal',                    # spaced letters
+            'Açtiοn required': 'Action required',                         # Greek omicron + cedilla
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(normalize_obfuscated_text(raw)[0], expected)
+        for genuine in ('Привет, это обычное письмо', 'Mật khẩu của bạn', 'Καλημέρα σας'):
+            self.assertEqual(normalize_obfuscated_text(genuine)[0], genuine)
+        _, counts = normalize_obfuscated_text('P𝐚yPal pаsswогd')
+        self.assertEqual((counts['mixed_style_word_count'], counts['mixed_script_word_count']), (1, 1))
+
+    def test_visible_html_text_drops_hidden_salting_and_joins_split_words(self):
+        from preprocess import extract_visible_html_text, prepare_semantic_text, extract_text_obfuscation_features
+        markup = ('<html><head><style>.pre{display:none}</style></head><body>'
+                  '<div class="pre">preheader salt</div>'
+                  '<div style="font-size:0">benign meeting agenda</div>'
+                  '<p>Confirm your Pa<span style="font-family:Arial">ss</span>word '
+                  '<font face="Courier">to</font>day</p>'
+                  '<span style="color:#fff;background-color:#ffffff">invisible words</span>'
+                  '<p>Thanks</p></body></html>')
+        text, stats = extract_visible_html_text(markup)
+        self.assertEqual(text, 'Confirm your Password today\nThanks')
+        self.assertEqual(stats['intra_word_tag_break_count'], 3)
+        self.assertGreaterEqual(stats['intra_word_font_switch_count'], 2)
+        self.assertEqual(stats['font_family_count'], 2)
+        msg = EmailMessage(); msg['Subject'] = 'Notice'
+        msg.set_content('fallback'); msg.add_alternative(markup, subtype='html')
+        semantic = prepare_semantic_text(msg.as_bytes())
+        for hidden in ('salt', 'agenda', 'invisible'):
+            self.assertNotIn(hidden, semantic)
+        self.assertGreater(extract_text_obfuscation_features(msg.as_bytes())['hidden_text_ratio'], 0.5)
+
+    @unittest.skipUnless(importlib.util.find_spec('zxingcpp'), 'optional QR tool; zxing-cpp not installed')
+    def test_qr_codes_are_decoded_from_images_attachments_tables_and_block_characters(self):
+        import io, zipfile, base64
+        import zxingcpp
+        from PIL import Image
+        from preprocess import inspect_email_qr_codes, extract_email_urls
+        url = 'https://bit.ly/secure-login-verify'
+        bitmap = np.asarray(zxingcpp.write_barcode(zxingcpp.BarcodeFormat.QRCode, url, width=150, height=150))
+        png = io.BytesIO(); Image.fromarray(bitmap).save(png, format='PNG'); png = png.getvalue()
+        modules = np.asarray(zxingcpp.write_barcode(zxingcpp.BarcodeFormat.QRCode, url, quiet_zone=0)) < 128
+
+        def message(attach=None, html=None, text='Scan the code to keep your mailbox active.'):
+            msg = EmailMessage(); msg['From'] = 'IT Desk <it@example.org>'; msg['Subject'] = 'Mailbox'
+            msg.set_content(text)
+            if html:
+                msg.add_alternative(html, subtype='html')
+            if attach:
+                msg.add_attachment(attach[0], maintype=attach[1], subtype=attach[2], filename=attach[3])
+            return msg.as_bytes()
+
+        office = io.BytesIO()
+        with zipfile.ZipFile(office, 'w') as archive:
+            archive.writestr('[Content_Types].xml', '<Types/>'); archive.writestr('word/media/image1.png', png)
+        table = '<table>' + ''.join('<tr>' + ''.join(
+            f'<td bgcolor="{"#000000" if dark else "#ffffff"}"></td>' for dark in row) + '</tr>' for row in modules) + '</table>'
+        rows = modules if len(modules) % 2 == 0 else np.vstack([modules, np.zeros((1, modules.shape[1]), bool)])
+        blocks = '\n'.join(''.join({(1, 1): '█', (1, 0): '▀', (0, 1): '▄', (0, 0): ' '}[(int(t), int(b))]
+                                   for t, b in zip(rows[i], rows[i + 1])) for i in range(0, len(rows), 2))
+        cases = {
+            'mime_image': message(attach=(png, 'image', 'png', 'scan.png')),
+            'html_data_uri': message(html=f'<p>Scan</p><img src="data:image/png;base64,{base64.b64encode(png).decode()}">'),
+            'attachment_container': message(attach=(office.getvalue(), 'application',
+                                                    'vnd.openxmlformats-officedocument.wordprocessingml.document', 'a.docx')),
+            'drawn_in_markup': message(html=f'<p>Scan</p>{table}'),
+        }
+        for origin, raw in cases.items():
+            report = inspect_email_qr_codes(raw)
+            self.assertEqual([(c['payload'], c['origin'], c['kind']) for c in report['codes']], [(url, origin, 'url')], origin)
+            features = report['features']
+            self.assertEqual((features['qr_only_link'], features['qr_url_risky_host_count'],
+                              features['qr_url_sender_domain_mismatch']), (1, 1, 1))
+        drawn = inspect_email_qr_codes(message(text='Scan:\n' + blocks))
+        self.assertEqual([c['payload'] for c in drawn['codes']], [url])
+        self.assertEqual(extract_email_urls(cases['mime_image'], include_qr=True), [url])
+        remote = inspect_email_qr_codes(message(html='<img src="https://cdn.example/qr.png">'))
+        self.assertEqual(remote['features']['qr_unscanned_image_count'], 1)
+
+    def test_handbook_link_and_sender_identity_features(self):
+        import base64
+        from preprocess import (extract_link_features, extract_message_security_features, _parse_email,
+                                brand_impersonation, extract_content_indicators)
+        victim = 'alice@example.org'
+        token = base64.b64encode(victim.encode()).decode().rstrip('=')
+        msg = EmailMessage()
+        msg['From'] = 'PayPal Service <service@paypa1-billing.com>'
+        msg['Reply-To'] = 'paypal.help@gmail.com'
+        msg['To'] = victim
+        msg['Subject'] = 'Account review'
+        msg.set_content('Please review your account. Keep this confidential and do not tell anyone.')
+        msg.add_alternative(
+            f'<a href="https://evil.example/login?u={token}">Review</a>'
+            f'<a href="https://tracker.example/r?url=https%3A%2F%2Fevil.example">Open</a>'
+            f'<a href="https://kit.weebly.com/x">PayPal Resolution Center</a>'
+            f'<a href="https://paypal.com/help">PayPal help</a>', subtype='html')
+        raw = msg.as_bytes()
+        links = extract_link_features(raw)
+        self.assertEqual(links['link_recipient_address_count'], 1)
+        self.assertEqual(links['link_open_redirect_count'], 1)
+        self.assertEqual(links['link_free_hosting_count'], 1)
+        self.assertEqual(links['link_anchor_brand_mismatch_count'], 1)  # official paypal.com link is not counted
+        header = extract_message_security_features(_parse_email(raw))
+        self.assertEqual((header['hdr_reply_to_freemail_divergence'], header['hdr_display_name_brand_mismatch'],
+                          header['hdr_sender_brand_lookalike']), (1, 1, 1))
+        self.assertEqual(extract_content_indicators(raw)['bec_secrecy_count'], 2)
+        for host, expected in (('paypa1.com', 'lookalike'), ('secure-paypal.com', 'combosquat'),
+                               ('apply.example.com', None), ('purchase-order.com', None), ('amazonses.com', None)):
+            verdict = brand_impersonation(host)
+            self.assertEqual(verdict[1] if verdict else None, expected, host)
+        clean = EmailMessage(); clean['From'] = 'Bob <bob@example.org>'; clean['To'] = victim
+        clean.set_content('Agenda at https://example.org/agenda')
+        self.assertEqual(sum(extract_link_features(clean.as_bytes()).values()), 0)
+
+    def test_attachment_payload_features_are_static_and_bounded(self):
+        import io, zipfile
+        from unittest.mock import patch
+        from preprocess import extract_attachment_payload_features, ATTACHMENT_PAYLOAD_FEATURE_NAMES
+        smuggle = (b'<html><script>var b=new Blob([atob("' + b'QUFB' * 600 + b'")]);'
+                   b'var a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="x.zip";</script></html>')
+        lnk = b'L\0\0\0\x01\x14\x02\0' + b'\0' * 64 + 'powershell -nop -w hidden'.encode('utf-16le')
+        onenote = bytes.fromhex('e4525c7b8cd8a74daeb15378d02996d3') + b'\0' * 32 + bytes.fromhex('e716e3bd65261145a4c48d4d0b7a9eac')
+        pdf = b'%PDF-1.7\n1 0 obj <</A <</S /URI /URI (https://evil.example)>> >> endobj\n%%EOF'
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as zf:
+            zf.writestr('invoice.js', b'payload')
+        data = bytearray(archive.getvalue())
+        data[6] |= 1  # mark the member as encrypted in the local header ...
+        data[data.find(b'PK\x01\x02') + 8] |= 1  # ... and in the central directory
+        msg = EmailMessage(); msg['From'] = 'a@example.org'; msg['To'] = 'b@example.org'
+        msg.set_content('Open the archive, password: Inv2026!')
+        # Signed profile: PKCS#7 DER wrapper, plist readable inside; the name hides the extension.
+        profile = (b'\x30\x82\x10\x00' + b'<plist><dict><key>PayloadContent</key><array><dict><key>PayloadType</key>'
+                   b'<string>com.apple.caldav.account</string></dict></array><key>PayloadType</key>'
+                   b'<string>Configuration</string></dict></plist>')
+        for payload, name in ((smuggle, 'statement.html'), (lnk, 'scan.lnk'), (onenote, 'notes.one'),
+                              (pdf, 'notice.pdf'), (bytes(data), 'invoice.zip'), (b'\0' * 64, 'disk.iso'),
+                              (profile, 'calendar.mobile')):
+            msg.add_attachment(payload, maintype='application', subtype='octet-stream', filename=name)
+        values = extract_attachment_payload_features(msg.as_bytes())
+        self.assertEqual(list(values), ATTACHMENT_PAYLOAD_FEATURE_NAMES)
+        for name in ('attachment_html_smuggling_count', 'attachment_lnk_command_count',
+                     'attachment_onenote_embedded_count', 'attachment_pdf_uri_count',
+                     'attachment_password_archive_in_body', 'attachment_disk_image_count',
+                     'attachment_config_profile_count'):
+            self.assertEqual(values[name], 1, name)
+        doc = EmailMessage(); doc['From'] = 'a@example.org'
+        doc.set_content('see attached')
+        doc.add_attachment(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1' + b'\0' * 504, maintype='application',
+                           subtype='msword', filename='invoice.doc')
+        fake = {'autoexec': 1, 'suspicious': 3, 'stomping': 1, 'xlm': 0}
+        with patch('preprocess._vba_indicators', return_value=fake):
+            macro = extract_attachment_payload_features(doc.as_bytes())
+        self.assertEqual((macro['attachment_vba_autoexec_count'], macro['attachment_vba_suspicious_count'],
+                          macro['attachment_vba_stomping_count']), (1, 3, 1))
 
     def test_local_tiny_bert_training_and_inference_without_download(self):
         from transformers import BertConfig, BertForSequenceClassification, BertTokenizerFast
