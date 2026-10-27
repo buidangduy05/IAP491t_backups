@@ -1,0 +1,220 @@
+{
+  "status": "complete",
+  "seconds": 686.097459748,
+  "counts": {
+    "files_scanned": 604537,
+    "emails_loaded": 818508,
+    "label_kind/phishing": 18462,
+    "source/20051114.mbox": 438,
+    "csv_records_read": 203897,
+    "label_kind/spam_or_phishing": 94328,
+    "source/CEAS_08.csv": 39154,
+    "label_kind/legitimate": 644197,
+    "csv_vector_or_unsupported": 7,
+    "csv_rows_without_email_content": 203176,
+    "source/Enron.csv": 29767,
+    "source/Ling.csv": 2859,
+    "metadata_skipped": 8,
+    "source/SpamAssasin.csv": 5809,
+    "source/TREC_05.csv": 55275,
+    "csv_rows_quarantined": 876,
+    "source/TREC_06.csv": 16400,
+    "source/TREC_07.csv": 53757,
+    "source/phishing-2015": 307,
+    "source/phishing-2016": 494,
+    "source/phishing-2017": 325,
+    "raw_rows_needing_review": 6,
+    "label_kind/unknown": 6,
+    "source/phishing-2018": 288,
+    "source/phishing-2019": 243,
+    "source/phishing-2020": 158,
+    "source/phishing-2021": 101,
+    "source/phishing-2022": 247,
+    "source/phishing-2023": 419,
+    "source/phishing-2024": 403,
+    "source/phishing-2025": 481,
+    "source/phishing0.mbox": 414,
+    "source/phishing1.mbox": 456,
+    "source/phishing2.mbox": 1423,
+    "source/spamassassin": 24796,
+    "label_kind/spam": 6690,
+    "source/enron": 517401,
+    "label_kind/malicious_synthetic": 49084,
+    "source/EPVME": 49084,
+    "phishing_pot_missing_from_checkout": 0,
+    "source/phishing_pot": 12268,
+    "empty": 1,
+    "files_excluded_by_policy": 2,
+    "malspam_recipient_header_restored": 3157,
+    "malspam_non_email_members_skipped": 3682,
+    "label_kind/malspam": 5741,
+    "source/malspam": 5741,
+    "url_dataset_files": 1
+  },
+  "errors": {},
+  "file_outcomes": {
+    "complete": 604537,
+    "excluded": 2,
+    "metadata": 8,
+    "url_dataset": 1
+  },
+  "record_outcomes": {
+    "loaded": 818508,
+    "no_email_content": 203176,
+    "quarantined": 877
+  },
+  "provenance": {
+    "/app/Dataset/phishing/CEAS_08.csv": {
+      "md5": "1f0d59191eec892a709995d48cd8decb",
+      "expected_md5": "1f0d59191eec892a709995d48cd8decb",
+      "matched": true,
+      "reference": "https://zenodo.org/records/8339691",
+      "labels": {
+        "0": "legitimate",
+        "1": "spam_or_phishing"
+      }
+    },
+    "/app/Dataset/phishing/Ceas-08_vectorized_data.csv": {
+      "status": "no_email_content",
+      "rows": 39154,
+      "columns": [
+        "0",
+        "label"
+      ]
+    },
+    "/app/Dataset/phishing/Enron.csv": {
+      "md5": "10489e0fdcc8af6fe62135c689367d40",
+      "expected_md5": "10489e0fdcc8af6fe62135c689367d40",
+      "matched": true,
+      "reference": "https://zenodo.org/records/8339691",
+      "labels": {
+        "0": "legitimate",
+        "1": "spam_or_phishing"
+      }
+    },
+    "/app/Dataset/phishing/Enron_vectorized_data.csv": {
+      "status": "no_email_content",
+      "rows": 29767,
+      "columns": [
+        "0",
+        "label"
+      ]
+    },
+    "/app/Dataset/phishing/Ling.csv": {
+      "md5": "eac6399dc0c7ae455aebb64423dadc8b",
+      "expected_md5": "eac6399dc0c7ae455aebb64423dadc8b",
+      "matched": true,
+      "reference": "https://zenodo.org/records/8339691",
+      "labels": {
+        "0": "legitimate",
+        "1": "spam_or_phishing"
+      }
+    },
+    "/app/Dataset/phishing/Ling_vectorized_data.csv": {
+      "status": "no_email_content",
+      "rows": 2859,
+      "columns": [
+        "0",
+        "label"
+      ]
+    },
+    "/app/Dataset/phishing/SpamAssasin.csv": {
+      "md5": "d921e0b2333bfaa058bd38193e6b3fbd",
+      "expected_md5": "d921e0b2333bfaa058bd38193e6b3fbd",
+      "matched": true,
+      "reference": "https://zenodo.org/records/8339691",
+      "labels": {
+        "0": "legitimate",
+        "1": "spam_or_phishing"
+      }
+    },
+    "/app/Dataset/phishing/SpamAssasin_vectorized_data.csv": {
+      "status": "no_email_content",
+      "rows": 5809,
+      "columns": [
+        "0",
+        "label"
+      ]
+    },
+    "/app/Dataset/phishing/TREC-05_vectorized_data.csv": {
+      "status": "no_email_content",
+      "rows": 55414,
+      "columns": [
+        "0",
+        "label"
+      ]
+    },
+    "/app/Dataset/phishing/TREC-06_vectorized_data.csv": {
+      "status": "no_email_content",
+      "rows": 16416,
+      "columns": [
+        "0",
+        "label"
+      ]
+    },
+    "/app/Dataset/phishing/TREC-07_vectorized_data.csv": {
+      "status": "no_email_content",
+      "rows": 53757,
+      "columns": [
+        "0",
+        "label"
+      ]
+    },
+    "/app/Dataset/phishing/TREC_05.csv": {
+      "md5": "ef4023fa9e64247212487b77a4c7d98e",
+      "expected_md5": "ef4023fa9e64247212487b77a4c7d98e",
+      "matched": true,
+      "reference": "https://zenodo.org/records/8339691",
+      "labels": {
+        "0": "legitimate",
+        "1": "spam_or_phishing"
+      }
+    },
+    "/app/Dataset/phishing/TREC_06.csv": {
+      "md5": "b840dc9477f86c098a71a0dfd25c928e",
+      "expected_md5": "b840dc9477f86c098a71a0dfd25c928e",
+      "matched": true,
+      "reference": "https://zenodo.org/records/8339691",
+      "labels": {
+        "0": "legitimate",
+        "1": "spam_or_phishing"
+      }
+    },
+    "/app/Dataset/phishing/TREC_07.csv": {
+      "md5": "e5a5ae0de1580965191cb32806dc0dae",
+      "expected_md5": "e5a5ae0de1580965191cb32806dc0dae",
+      "matched": true,
+      "reference": "https://zenodo.org/records/8339691",
+      "labels": {
+        "0": "legitimate",
+        "1": "spam_or_phishing"
+      }
+    },
+    "/app/Dataset/phishing_pot": {
+      "status": "corpus",
+      "reference": "https://github.com/rf-peixoto/phishing_pot",
+      "license": "CC BY-NC 4.0",
+      "commit": null,
+      "samples_present": 12270,
+      "samples_tracked": null,
+      "missing_from_checkout": null
+    },
+    "/app/Dataset/phishing_pot/email/sample-3989.csv": {
+      "status": "excluded",
+      "reason": "Phishing Pot sample folder holds only .eml; other files are not read"
+    },
+    "/app/Dataset/StealthPhisher2025.csv": {
+      "status": "url_dataset",
+      "reason": "Labelled URL corpus, not email; use load_url_dataset()",
+      "bytes": 93319036,
+      "md5": "52f45ac98099b735af2b2ce440bb5866"
+    },
+    "/app/Dataset/df.csv": {
+      "status": "excluded",
+      "reason": "Undocumented numeric labels 0/1/2; pre-cleaned lowercase text without MIME, headers or URLs; most rows copy Enron/CEAS/Ling/SpamAssassin CSVs that are already loaded",
+      "bytes": 630619610,
+      "md5": "2665da8c0b77e24f238fbcbe1e41610b"
+    }
+  },
+  "ledger": "ingestion.sqlite"
+}
