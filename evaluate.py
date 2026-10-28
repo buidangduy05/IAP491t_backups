@@ -85,15 +85,50 @@ def classification_metrics(y, scores, threshold):
             'TN': int(tn), 'FP': int(fp), 'FN': int(fn), 'TP': int(tp)}
 
 
+def _artifact_problem(path):
+    """Why a manifest artifact cannot be verified, or None if it can."""
+    if not path.exists():
+        return 'missing'
+    with open(path, 'rb') as handle:
+        if handle.read(40).startswith(b'version https://git-lfs.github.com/spec/'):
+            return 'Git LFS pointer, content not downloaded (git lfs pull)'
+    return None
+
+
+def attachment_rule_flags(X, manifest, model_dir):
+    """Per test email, the ATTACHMENT_RULES that fire, recovered from the scaled X columns.
+
+    Returns None for runs whose feature set lacks the rule features (before 2026-10-23).
+    """
+    from preprocess import ATTACHMENT_RULES
+    names = manifest.get('settings', {}).get('feature_names', [])
+    if not set(ATTACHMENT_RULES.values()) <= set(names):
+        return None
+    with (model_dir / 'feature_scaler.pkl').open('rb') as handle:
+        scaler = pickle.load(handle)
+    offset = int(manifest['settings']['doc2vec_dim'])
+    values = scaler.inverse_transform(X[:, offset:].astype(np.float64))
+    columns = {rule: values[:, names.index(feature)] > 0.5 for rule, feature in ATTACHMENT_RULES.items()}
+    return pd.DataFrame(columns)
+
+
 def evaluate(base_dir=BASE_DIR):
     base = Path(base_dir)
     model_dir = base / 'dumped_models' / 'classification'
     manifest_path = model_dir / 'run_manifest.json'
+    if not model_dir.is_dir():
+        raise FileNotFoundError(f'{model_dir} does not exist: train first, e.g. '
+                                f'python train.py --output {base_dir}')
     manifest = None
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         if manifest.get('status') != 'complete':
             raise RuntimeError('Training is incomplete; refusing to mix artifacts from different runs')
+        problems = {relative: problem for relative in manifest['artifacts']
+                    if (problem := _artifact_problem(base / relative))}
+        if problems:
+            raise RuntimeError('Cannot verify this run; artifacts unavailable: '
+                               + '; '.join(f'{name} ({why})' for name, why in problems.items()))
         for relative, expected in manifest['artifacts'].items():
             if file_digest(base / relative) != expected:
                 raise RuntimeError(f'Artifact changed since training: {relative}. Retrain/recover the same run.')
@@ -116,16 +151,21 @@ def evaluate(base_dir=BASE_DIR):
         if len(metadata) != len(y) or not np.array_equal(metadata['Class'].to_numpy(), y):
             raise ValueError('Test provenance is not aligned with test arrays')
     results, curves, matrices, errors, by_source = [], [], [], [], []
+    rules = attachment_rule_flags(X, manifest, model_dir) if manifest else None
+    flagged = rules.any(axis=1).to_numpy() if rules is not None else None
+    if rules is not None:
+        summary = pd.DataFrame({'Rule': rules.columns, 'Flagged': rules.sum().to_numpy(),
+                                'Positives': [int(y[rules[c].to_numpy()].sum()) for c in rules.columns]})
+        summary.to_csv(base / 'attachment_rule_hits.csv', index=False)
+        print(f'Attachment rules flag {int(flagged.sum())} test emails '
+              f'({int(y[flagged].sum())} positive):', flush=True)
+        print(summary.to_string(index=False), flush=True)
     for name, config in configurations.items():
         kind = config.get('kind', 'sklearn')
-        if kind == 'bert':
-            if not manifest:
-                raise ValueError('BERT evaluation requires a complete run manifest')
-            scores = np.load(base / config['test_scores'], allow_pickle=False)
-            if (scores.shape != y.shape or not np.isfinite(scores).all() or
-                    ((scores < 0) | (scores > 1)).any()):
-                raise ValueError('BERT probabilities are invalid or not aligned with test emails')
-        elif kind == 'sklearn':
+        if kind == 'bert':  # Runs before 2026-10-24 also trained BERT; it is no longer evaluated.
+            print(f'Skipping {name}: BERT was removed from the pipeline', flush=True)
+            continue
+        if kind == 'sklearn':
             with (model_dir / config['file']).open('rb') as handle:
                 model = pickle.load(handle)
             scores = positive_scores(model, X)
@@ -139,6 +179,13 @@ def evaluate(base_dir=BASE_DIR):
         if manifest:
             row['Selected-on-validation'] = name == manifest['selected_model']
         results.append(row)
+        if flagged is not None:
+            # Model OR decisive attachment rule, at the model's own validation threshold. Listed
+            # only when a rule changes a decision (otherwise it duplicates the model's row).
+            gated = classification_metrics(y, np.where(flagged, 1.0, scores), threshold)
+            if (gated['TP'], gated['FP']) != (metrics['TP'], metrics['FP']):
+                results.append({**row, 'Model': f'{name} + attachment rules', **gated,
+                                'Precision@0.5': None, 'Recall@0.5': None})
         fpr, tpr, _ = roc_curve(y, scores)
         curves.append((name, fpr, tpr, metrics['ROC-AUC']))
         predicted = (scores >= threshold).astype(int)

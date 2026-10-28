@@ -30,11 +30,6 @@ from email import policy
 from email.header import decode_header
 from functools import lru_cache
 from collections import defaultdict
-from textblob import TextBlob
-import nltk
-from nltk.corpus import wordnet
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
 
 import email
 from email.utils import parseaddr, getaddresses
@@ -62,9 +57,10 @@ def expand_negations(text):
 
 
 def spelling_correction(text):
-    text = TextBlob(text)
-    text = text.correct()
-    return text
+    # Unused by the pipeline. TextBlob pulls in nltk, which was removed for an unfixed CVE
+    # (2026-10-26); install textblob separately to call this.
+    from textblob import TextBlob
+    return TextBlob(text).correct()
 
 
 def remove_stopwords(text):
@@ -73,6 +69,21 @@ def remove_stopwords(text):
 
 def tokenize_text(text):
     return [w.lower() for w in re.findall(r"\b\w+\b", str(text)) if len(w) >= 2]
+
+
+# Tham số suy luận Doc2Vec dùng chung cho train.py và web demo: hai bên phải
+# gọi cùng một hàm để vector lúc phục vụ trùng với vector lúc huấn luyện.
+DOC2VEC_INFER_ALPHA = 0.025
+DOC2VEC_INFER_MIN_ALPHA = 0.0005
+
+
+def infer_document_vector(model, text, epochs):
+    """Suy luận vector cho văn bản đã làm sạch; seed theo nội dung để lặp lại được."""
+    words = tokenize_text(text) or ["emptyemailtoken"]
+    seed = int.from_bytes(hashlib.sha256(" ".join(words).encode()).digest()[:4], "big")
+    model.random.seed(seed)
+    return model.infer_vector(words, alpha=DOC2VEC_INFER_ALPHA,
+                              min_alpha=DOC2VEC_INFER_MIN_ALPHA, epochs=epochs)
 
 
 # --------------------------------------------------------------------------
@@ -99,11 +110,56 @@ def _content_subject(msg):
 # models learn the literal word "phishing" as the label. Headers and link features keep
 # it: a recipient address inside a URL is a genuine kit signal. No word boundaries: the
 # maintainer's sed often glued it to neighbours ("phishing@potSie", "&#phishing@pot6;").
-_REDACTION_PLACEHOLDERS = re.compile(r"phishing\s*(?:@|%40|&#0*64;|&commat;|\[at\]|\(at\))\s*pot", re.I)
+# The second alternative is the neutral recipient that _normalize_redactions() writes
+# for malware-traffic-analysis.net placeholders.
+_REDACTION_PLACEHOLDERS = re.compile(r"phishing\s*(?:@|%40|&#0*64;|&commat;|\[at\]|\(at\))\s*pot|"
+                                     r"(?:(?:recipient|sender)(?:@|%40))?(?:mail\.)?(?:recipient|sender)-domain\.example",
+                                     re.I)
+
+# malware-traffic-analysis.net redacts malspam by hand: "[recipient's email address]",
+# "[recipient's email domain]", "[removed]"... (95% of its emails). Recipient addresses
+# become one neutral address under the reserved .example TLD, so To and personalised
+# URLs (?n=[recipient's email address]) still look like an address to header and link
+# features; names and other redactions are dropped ("Customer" would fake a generic
+# greeting). The text pipeline then masks the neutral address like phishing@pot.
+# "recip" also covers the author's typos ("[recipeint's email domain]"); spoofed senders
+# ("[spoofed sender email address]") get their own neutral address so From-based header
+# features still see one. Anything "...removed..." or naming a person is dropped.
+_RECIPIENT_PLACEHOLDER = re.compile(rb"\[[^\]\r\n]{0,40}recip[^\]\r\n]{0,60}\]", re.I)
+_SENDER_PLACEHOLDER = re.compile(rb"\[[^\]\r\n]{0,30}sender[^\]\r\n]{0,40}\]", re.I)
+_AUTHOR_REDACTION = re.compile(rb"\[(?:[^\]\r\n]{0,40}\bremoved\b[^\]\r\n]{0,20}|redacted|reacted|attachment omitted|"
+                               rb"malicious attachment redacted|base64 string|random name|unknown|fname lname|"
+                               rb"string of alphabetic characters)\]", re.I)
+
+
+def _neutral_party(party):
+    def replace(match):
+        placeholder = match.group(0).lower()
+        if b"name" in placeholder:
+            return b""
+        if b"domain" in placeholder:
+            return party + b"-domain.example"
+        if b"server" in placeholder:
+            return b"mail." + party + b"-domain.example"
+        return party + b"@" + party + b"-domain.example"
+    return replace
+
+
+def _normalize_redactions(raw):
+    if b"[" not in raw:
+        return raw
+    raw = _RECIPIENT_PLACEHOLDER.sub(_neutral_party(b"recipient"), raw)
+    return _AUTHOR_REDACTION.sub(b"", _SENDER_PLACEHOLDER.sub(_neutral_party(b"sender"), raw))
+
+
+# Same author redactions after MIME decoding: inside base64/quoted-printable bodies and
+# encoded-word subjects the raw-byte pass in _normalize_redactions() cannot see them.
+_DECODED_REDACTION = re.compile(r"\[[^\]\n]{0,60}(?:recip|sender|removed|redacted|spoofed)[^\]\n]{0,60}\]", re.I)
 
 
 def _without_corpus_artifacts(text):
-    return _REDACTION_PLACEHOLDERS.sub(" ", _TEMPLATE_PHRASES.sub(" ", text))
+    text = _DECODED_REDACTION.sub(" ", _TEMPLATE_PHRASES.sub(" ", text))
+    return _REDACTION_PLACEHOLDERS.sub(" ", text)
 
 
 SHORTENER_DOMAINS = {
@@ -342,11 +398,30 @@ def normalize_url(url):
     return url if re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I) else "http://" + url
 
 
+@lru_cache(maxsize=1)
+def _public_suffix_list():
+    import tldextract
+    # Snapshot bundled with the pinned tldextract version: no network fetch, so the
+    # result is reproducible. Private suffixes make user.github.io its own site.
+    return tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None, include_psl_private_domains=True)
+
+
+@lru_cache(maxsize=131072)
+def _psl_parts(host):
+    return _public_suffix_list()(host)
+
+
 def registrable_domain(host):
-    """Approximate eTLD+1 without a public-suffix download; IP hosts are kept whole."""
+    """eTLD+1 by the Public Suffix List; IP hosts are kept whole.
+
+    Hosts without a known suffix (intranet names such as Enron's) keep the last two labels.
+    """
     host = str(host).lower().strip(".")
     if re.fullmatch(r"[\d.]+|\[?[0-9a-f:]+\]?", host):
         return host
+    found = _psl_parts(host).top_domain_under_public_suffix
+    if found:
+        return found
     labels = [label for label in host.split(".") if label]
     if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL_LABELS:
         return ".".join(labels[-3:])
@@ -474,6 +549,8 @@ MESSAGE_SECURITY_FEATURE_NAMES = [
     # Handbook Ch. 7.3 mismatch triangle and lookalike sender domains.
     "hdr_reply_to_freemail_divergence", "hdr_display_name_other_address",
     "hdr_display_name_brand_mismatch", "hdr_sender_brand_lookalike", "hdr_sender_brand_combosquat",
+    # Sender domain imitates a recipient's domain (lookalike of the victim's own company).
+    "hdr_sender_recipient_lookalike",
 ]
 # A cid: reference count was measured and dropped: it fired in 15-26% of every
 # EPVME family but ~0% of legitimate mail, because EPVME bodies come from
@@ -552,7 +629,12 @@ def extract_message_security_features(msg):
     sender_hosts = {d for d in (from_domain, bounce_domain, reply_domain) if d}
     impersonation = [brand_impersonation(d) for d in sender_hosts]
     display_brands = _brand_in_text(display)
+    recipient_values = raw.get("To", []) + [str(v) for v in (msg.get_all("Cc") or [])]
+    recipient_domains = {registrable_domain(_address_domain(a))
+                         for _, a in getaddresses([_decode_header_value(v) for v in recipient_values]) if "@" in a}
+    from_registered = registrable_domain(from_domain) if from_domain else ""
     values_identity = {
+        "hdr_sender_recipient_lookalike": int(any(domains_look_alike(from_registered, d) for d in recipient_domains)),
         "hdr_reply_to_freemail_divergence": int(reply_domain in FREEMAIL_DOMAINS and bool(from_domain)
                                                 and from_domain not in FREEMAIL_DOMAINS),
         "hdr_display_name_other_address": int(bool(shown_address) and bool(addresses) and
@@ -1656,6 +1738,36 @@ def brand_impersonation(host):
     return None
 
 
+def _domain_label(domain):
+    """Label before the public suffix: globex-supplies for mail.globex-supplies.co.uk."""
+    return _psl_parts(domain).domain or str(domain).split(".")[0]
+
+
+@lru_cache(maxsize=131072)
+def domains_look_alike(a, b):
+    """True when registrable domain a imitates b without being it (any domain, no list).
+
+    Same label under another suffix (amazon.de / amazon.com, hotmail.co.uk / hotmail.com)
+    is not counted: regional sites are too common. Labels under 5 characters are skipped;
+    5-character labels need a visual match, since one edit joins real names (apple/apply).
+    """
+    if not a or not b or a == b:
+        return False
+    x, y = _domain_label(a), _domain_label(b)
+    if x == y or min(len(x), len(y)) < 5:
+        return False
+    if _skeleton(x) == _skeleton(y) or y in x.split("-") or x in y.split("-"):
+        return True
+    shortest, longest = sorted((len(x), len(y)))
+    # Changed ending of a long name: globex-supply / globex-supplies.
+    if shortest >= 8 and len(os.path.commonprefix([x, y])) >= longest - 3:
+        return True
+    if shortest < 6:
+        return False
+    limit = 1 if longest < 8 else 2
+    return longest - shortest <= limit and _edit_distance(x, y) <= limit
+
+
 def _brand_in_text(text):
     words = set(re.findall(r"[a-z0-9]+", str(text).lower()))
     joined = re.sub(r"[^a-z0-9]", "", str(text).lower())
@@ -1672,7 +1784,19 @@ def _is_official_for(brand, host):
 LINK_FEATURE_NAMES = [
     "link_recipient_address_count", "link_open_redirect_count", "link_brand_lookalike_count",
     "link_brand_combosquat_count", "link_anchor_brand_mismatch_count", "link_free_hosting_count",
+    # Sender consistency: works for any domain, not only BRAND_DOMAINS. Measured and NOT
+    # used (2026-10-25): domain popularity from Tranco 262N9, because enron.com and most
+    # 2001-2008 legitimate domains are unranked in a 2026 list (Enron: all links unranked
+    # in 58% of linked mail, phishing 21-30%); and "host on a PSL private suffix", which
+    # marks era (Nazario 2015+ 14%, Phishing Pot 22%) but Nazario 2004-07 only 1.2%.
+    "link_offsite_domain_ratio", "link_sender_lookalike_count",
+    # Shape of the most unusual link host (random/generated domains).
+    "link_max_host_length", "link_max_subdomain_depth", "link_max_host_hyphen_count",
+    "link_max_host_digit_count", "link_max_host_entropy", "link_punycode_count",
 ]
+_HOST_SHAPE = {"link_max_host_length": "url_host_length", "link_max_subdomain_depth": "url_subdomain_count",
+               "link_max_host_hyphen_count": "url_host_hyphen_count",
+               "link_max_host_digit_count": "url_host_digit_count", "link_max_host_entropy": "url_host_entropy"}
 _OPEN_REDIRECT = re.compile(r"[?&#][\w.\-\[\]]*=(?:https?(?::|%3a)(?://|%2f%2f)|%2f%2f|//|www\.)", re.I)
 
 
@@ -1700,7 +1824,10 @@ def extract_link_features(msg):
     plain, markup = _get_email_body(msg)
     urls = _find_urls(plain, markup)
     markers = _recipient_markers(msg)
+    sender = parseaddr(str(msg.get("From", "")))[1]
+    sender_domain = registrable_domain(_address_domain(sender)) if "@" in sender else ""
     values = defaultdict(float)
+    link_domains = set()
     for url in urls:
         lowered = url.lower()
         values["link_recipient_address_count"] += any(m in lowered for m in markers)
@@ -1710,6 +1837,15 @@ def extract_link_features(msg):
         if verdict:
             values["link_brand_" + verdict[1] + "_count"] += 1
         values["link_free_hosting_count"] += any(host == s or host.endswith("." + s) for s in FREE_HOSTING_SUFFIXES)
+        if host:
+            link_domains.add(registrable_domain(host))
+            shape = dict(zip(URL_LEXICAL_FEATURE_NAMES, extract_url_lexical_features(url)))
+            for name, source in _HOST_SHAPE.items():
+                values[name] = max(values[name], shape[source])
+            values["link_punycode_count"] += shape["url_has_punycode"]
+    if sender_domain and link_domains:
+        values["link_offsite_domain_ratio"] = sum(d != sender_domain for d in link_domains) / len(link_domains)
+        values["link_sender_lookalike_count"] = sum(domains_look_alike(d, sender_domain) for d in link_domains)
     for match in re.finditer(r'<a\b[^>]*\bhref\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</a\s*>', markup, re.I | re.S):
         href = html_module.unescape(match.group(1)).strip()
         if not re.match(r"(?:https?:)?//|www\.", href, re.I):
@@ -1946,6 +2082,72 @@ def extract_engineered_features(raw_text):
         raise  # Do not silently train on a fabricated all-zero vector.
 
 
+# Baseline (Doc2Vec + 10 classifiers) input: FEATURE_NAMES, then the header/link/
+# attachment/HTML groups added for detection techniques. Text-obfuscation counts and
+# BEC indicators stay out: in these corpora they mark the source, not phishing.
+BASELINE_EXTRA_FEATURES = (
+    ("_message_security", MESSAGE_SECURITY_FEATURE_NAMES), ("_link_features", LINK_FEATURE_NAMES),
+    ("_attachment_payload", ATTACHMENT_PAYLOAD_FEATURE_NAMES), ("_html_features", HTML_SECURITY_FEATURE_NAMES))
+BASELINE_FEATURE_NAMES = FEATURE_NAMES + [name for _, names in BASELINE_EXTRA_FEATURES for name in names]
+assert len(set(BASELINE_FEATURE_NAMES)) == len(BASELINE_FEATURE_NAMES)
+
+
+# Decisive attachment gates (verdict cascade of the Phishing Email Investigation Guide).
+# A model trained on email labels cannot learn these: almost no training email carries
+# them, so their learned weight is ~0. Each rule is a static indicator that legitimate
+# mail practically never contains; it flags the email on its own and leaves the model's
+# score unchanged. rule -> BASELINE_FEATURE_NAMES entry; fires when the value is > 0.
+# Measured 2026-10-25 on every email with an attachment (legitimate: only SpamAssassin
+# ham, 119 emails, carries attachments; Enron maildir and the CSVs have none): each rule
+# below fired on 0 of them. Not rules: has_executable_attachment (5/119 legitimate),
+# script/form and PDF active content (common in legitimate HTML/PDF files, and the model
+# has 200+ phishing examples to learn them from).
+ATTACHMENT_RULES = {
+    "disguised_executable": "attachment_disguised_executable_count",
+    "embedded_executable": "attachment_embedded_executable_count",
+    "double_extension": "has_double_extension_attachment",
+    "bidi_filename": "attachment_bidi_filename_count",
+    "vba_autoexec": "attachment_vba_autoexec_count",
+    "vba_stomping": "attachment_vba_stomping_count",
+    "xlm_macro": "attachment_xlm_macro_count",
+    "lnk_command": "attachment_lnk_command_count",
+    "html_smuggling": "attachment_html_smuggling_count",
+    "disk_image": "attachment_disk_image_count",
+    "onenote_embedded": "attachment_onenote_embedded_count",
+    "password_archive_in_body": "attachment_password_archive_in_body",
+    # Device profiles are installed through MDM, not mailed by strangers (Phishing Pot: 37).
+    "config_profile": "attachment_config_profile_count",
+}
+
+
+def attachment_rule_hits(values):
+    """Names of the ATTACHMENT_RULES that fire for one email's {feature name: value}."""
+    return [rule for rule, name in ATTACHMENT_RULES.items() if values[name] > 0]
+
+
+def baseline_feature_vector(row):
+    """Ordered BASELINE_FEATURE_NAMES from a features-stage row of pipeline_cache."""
+    return [*map(float, row["_features"]),
+            *(float(row[column][name]) for column, names in BASELINE_EXTRA_FEATURES for name in names)]
+
+
+def assess_attachment_rules(raw_text):
+    """ATTACHMENT_RULES that fire for one raw email (for a web demo, next to the model score)."""
+    return attachment_rule_hits(dict(zip(BASELINE_FEATURE_NAMES, extract_baseline_features(raw_text))))
+
+
+def extract_baseline_features(raw_text):
+    """BASELINE_FEATURE_NAMES for one raw email; a web demo must use this, not FEATURE_NAMES."""
+    msg = _parse_email(raw_text)
+    _, markup = _get_email_body(msg)
+    return baseline_feature_vector({
+        "_features": extract_engineered_features(msg),
+        "_message_security": extract_message_security_features(msg),
+        "_link_features": extract_link_features(msg),
+        "_attachment_payload": extract_attachment_payload_features(msg),
+        "_html_features": extract_html_security_features(markup)})
+
+
 # --------------------------------------------------------------------------
 # Khử trùng lặp / gần trùng (chống data leakage)
 # --------------------------------------------------------------------------
@@ -2000,8 +2202,10 @@ def _parse_email(raw):
     if isinstance(raw, email.message.Message):
         return raw
     if isinstance(raw, bytes):
-        msg = email.message_from_bytes(raw, policy=policy.compat32)
+        msg = email.message_from_bytes(_normalize_redactions(raw), policy=policy.compat32)
     elif isinstance(raw, str):
+        if "[" in raw:
+            raw = _normalize_redactions(raw.encode("utf-8", "surrogateescape")).decode("utf-8", "surrogateescape")
         msg = email.message_from_string(raw, policy=policy.compat32)
     else:
         raise TypeError("Email must be str or bytes")
@@ -2024,12 +2228,29 @@ def _normalize(text):
 
 @lru_cache(maxsize=1)
 def _english_stopwords():
-    try:
-        words = set(stopwords.words("english"))
-    except LookupError:
-        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
-        words = set(ENGLISH_STOP_WORDS)
-    return words - {"no", "not", "nor", "never"}
+    # Negations carry meaning ("do not click"), so they stay in the text.
+    return NLTK_ENGLISH_STOPWORDS - {"no", "not", "nor", "never"}
+
+
+# The nltk 3.10.3 "english" stopwords corpus, copied verbatim so the cleaned text is
+# unchanged after nltk was removed (unfixed CVE-2026-81726, 2026-10-26).
+NLTK_ENGLISH_STOPWORDS = frozenset((
+    "a", "about", "above", "after", "again", "against", "ain", "all", "am", "an", "and", "any", "are", "aren",
+    "aren't", "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", "by",
+    "can", "couldn", "couldn't", "d", "did", "didn", "didn't", "do", "does", "doesn", "doesn't", "doing", "don",
+    "don't", "down", "during", "each", "few", "for", "from", "further", "had", "hadn", "hadn't", "has", "hasn",
+    "hasn't", "have", "haven", "haven't", "having", "he", "he'd", "he'll", "he's", "her", "here", "hers",
+    "herself", "him", "himself", "his", "how", "i", "i'd", "i'll", "i'm", "i've", "if", "in", "into", "is",
+    "isn", "isn't", "it", "it'd", "it'll", "it's", "its", "itself", "just", "ll", "m", "ma", "me", "mightn",
+    "mightn't", "more", "most", "mustn", "mustn't", "my", "myself", "needn", "needn't", "no", "nor", "not",
+    "now", "o", "of", "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out", "over",
+    "own", "re", "s", "same", "shan", "shan't", "she", "she'd", "she'll", "she's", "should", "should've",
+    "shouldn", "shouldn't", "so", "some", "such", "t", "than", "that", "that'll", "the", "their", "theirs",
+    "them", "themselves", "then", "there", "these", "they", "they'd", "they'll", "they're", "they've", "this",
+    "those", "through", "to", "too", "under", "until", "up", "ve", "very", "was", "wasn", "wasn't", "we",
+    "we'd", "we'll", "we're", "we've", "were", "weren", "weren't", "what", "when", "where", "which", "while",
+    "who", "whom", "why", "will", "with", "won", "won't", "wouldn", "wouldn't", "y", "you", "you'd", "you'll",
+    "you're", "you've", "your", "yours", "yourself", "yourselves"))
 
 
 def deduplicate_emails(data, report_path="label_conflicts.csv", return_audit=False):
@@ -2061,7 +2282,7 @@ def deduplicate_emails(data, report_path="label_conflicts.csv", return_audit=Fal
         # A synthetic copy of a Nazario email yields to the original; it outranks
         # spam copies so the label-scope step does not discard it with them.
         data = data.assign(_label_rank=data.LabelKind.map(
-            {"legitimate": 0, "phishing": 0, "malicious_synthetic": 1, "spam": 2,
+            {"legitimate": 0, "phishing": 0, "malspam": 0, "malicious_synthetic": 1, "spam": 2,
              "positive_unspecified": 3}).fillna(4))
         data = data.sort_values("_label_rank", kind="stable").drop(columns="_label_rank")
     else:
@@ -2090,6 +2311,11 @@ def _simhash(text):
     return sum(1 << bit for bit, count in enumerate(counts) if 2 * count >= len(values))
 
 
+def group_signature(body, exact):
+    """(body hash, SimHash or None) that group_email_variants compares; exact is the dedup key."""
+    return hashlib.sha256((body or exact).encode()).hexdigest(), _simhash(body)
+
+
 def group_email_variants(data, group_attachments=False):
     """Keep near duplicates, but put a whole SimHash group in one split.
 
@@ -2108,8 +2334,10 @@ def group_email_variants(data, group_attachments=False):
             parent[max(a, b)] = min(a, b)
     bodies, hashes, bands = {}, {}, defaultdict(set)
     attachment_owners = {}
-    prepared_bodies = data['_group_body'] if '_group_body' in data else [None] * len(data)
-    for i, (raw, exact, body) in enumerate(zip(data.Text, data._dedup_key, prepared_bodies)):
+    # The identity stage stores only (body hash, SimHash), not the body text: ~800k bodies
+    # did not fit the sandbox memory limit.
+    prepared = zip(data['_group_key'], data['_simhash']) if '_group_key' in data else None
+    for i, (raw, exact) in enumerate(zip(data.Text, data._dedup_key)):
         if group_attachments:
             digests = data['_attachment_hashes'].iloc[i] if '_attachment_hashes' in data else []
             for digest in digests:
@@ -2117,16 +2345,19 @@ def group_email_variants(data, group_attachments=False):
                     union(i, attachment_owners[digest])
                 else:
                     attachment_owners[digest] = i
-        if body is None:
+        if prepared is not None:
+            body_key, fingerprint = next(prepared)
+            # pandas may hold missing fingerprints as None or NaN and present ones as numpy ints.
+            fingerprint = None if fingerprint is None or fingerprint != fingerprint else int(fingerprint)
+        else:
             msg = _parse_email(raw)
             plain, markup = _get_email_body(msg)
             body = _normalize("\n".join(dict.fromkeys(p for p in (plain, _strip_html(markup)) if p.strip())))
-        body_key = hashlib.sha256((body or exact).encode()).hexdigest()
+            body_key, fingerprint = group_signature(body, exact)
         if body_key in bodies:
             union(i, bodies[body_key])
             continue
         bodies[body_key] = i
-        fingerprint = _simhash(body)
         if fingerprint is None:
             continue
         if fingerprint in hashes:
@@ -2184,97 +2415,6 @@ def split_train_validation_test(data, validation_size=0.2, test_size=0.2, seed=4
     return train, validation, test
 
 
-def prepare_semantic_text(raw):
-    """Decoded subject/body for BERT; preserve sentences, negation and word order."""
-    # Visible text after deobfuscation: hidden "salting" text never reaches BERT.
-    text = _deobfuscated_message_text(_parse_email(raw))[0]
-    return unicodedata.normalize("NFC", text.replace("\x00", " ")).strip() or "[empty email]"
-
-
-class BertEmailClassifier:
-    """Fine-tuned BERT inference with all overlapping windows, aggregated per email.
-
-    predict_proba accepts decoded semantic strings. predict_emails accepts raw MIME.
-    No attachment bytes are sent to the language model.
-    """
-    def __init__(self, model, tokenizer, device=None, max_length=256, stride=64, batch_size=4):
-        import torch
-        self.model, self.tokenizer = model, tokenizer
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.max_length, self.stride, self.batch_size = max_length, stride, batch_size
-        if not 4 <= max_length <= model.config.max_position_embeddings:
-            raise ValueError("BERT window length exceeds checkpoint configuration")
-        if not 0 <= stride < max_length - tokenizer.num_special_tokens_to_add(pair=False):
-            raise ValueError("BERT stride must be smaller than window content length")
-        if batch_size < 1:
-            raise ValueError("BERT batch_size must be positive")
-        self.model.to(self.device)
-        self.classes_ = [0, 1]
-        self.decision_threshold_ = float(getattr(model.config, "email_threshold", 0.5))
-
-    @classmethod
-    def from_pretrained(cls, checkpoint, device=None, batch_size=4, max_length=None, stride=None):
-        from transformers import BertForSequenceClassification, BertTokenizerFast
-        tokenizer = BertTokenizerFast.from_pretrained(str(checkpoint))
-        model = BertForSequenceClassification.from_pretrained(
-            str(checkpoint), num_labels=2, use_safetensors=True)
-        return cls(model, tokenizer, device,
-                   max_length or getattr(model.config, "email_max_length", 256),
-                   stride if stride is not None else getattr(model.config, "email_stride", 64),
-                   batch_size)
-
-    def encode_windows(self, text):
-        # Let the fast tokenizer emit overflow windows; never truncate to the first window.
-        encoded = self.tokenizer(
-            str(text), truncation=True, max_length=self.max_length, stride=self.stride,
-            return_overflowing_tokens=True, padding=False, return_attention_mask=True)
-        return [{key: values[i] for key, values in encoded.items()
-                 if key in {"input_ids", "attention_mask", "token_type_ids"}}
-                for i in range(len(encoded["input_ids"]))]
-
-    def predict_proba(self, texts):
-        import numpy as np
-        import torch
-        self.model.eval()
-        scores = np.zeros(len(texts), dtype=np.float32)
-        pending, owners = [], []
-        def flush():
-            if not pending:
-                return
-            tensors = self.tokenizer.pad(pending, padding=True, return_tensors="pt")
-            tensors = {key: value.to(self.device) for key, value in tensors.items()}
-            with torch.inference_mode():
-                probabilities = self.model(**tensors).logits.float().softmax(-1)[:, 1].cpu().numpy()
-            for owner, probability in zip(owners, probabilities):
-                scores[owner] = max(scores[owner], float(probability))
-            pending.clear()
-            owners.clear()
-        for i, text in enumerate(texts):
-            for window in self.encode_windows(text):
-                pending.append(window)
-                owners.append(i)
-                if len(pending) >= self.batch_size:
-                    flush()
-            if (i + 1) % 5000 == 0:
-                print(f'BERT inferred {i + 1}/{len(texts)} emails', flush=True)
-        flush()
-        return np.column_stack([1.0 - scores, scores])
-
-    def predict_emails(self, raw_messages):
-        return self.predict_proba([prepare_semantic_text(raw) for raw in raw_messages])
-
-    def save_pretrained(self, directory):
-        self.model.config.email_max_length = self.max_length
-        self.model.config.email_stride = self.stride
-        self.model.config.email_aggregation = "max_window_probability"
-        self.model.config.email_threshold = self.decision_threshold_
-        positive = getattr(self.model.config, "email_positive_label", "phishing")
-        self.model.config.id2label = {0: "legitimate", 1: positive}
-        self.model.config.label2id = {"legitimate": 0, positive: 1}
-        self.model.save_pretrained(str(directory), safe_serialization=True)
-        self.tokenizer.save_pretrained(str(directory))
-
-
 def inspect_email_file(path):
     """Convenience entry point for checking a local .eml without executing files."""
     from pathlib import Path
@@ -2285,21 +2425,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Static attachment indicators; not a malware-free certificate")
     parser.add_argument("email_file", help="Path to a raw .eml email")
-    parser.add_argument("--bert-checkpoint", help="Local fine-tuned BERT directory (optional)")
     args = parser.parse_args()
     from pathlib import Path
     raw = Path(args.email_file).read_bytes()
-    result = {"attachments": inspect_email_attachments(raw)}
-    if args.bert_checkpoint:
-        checkpoint = Path(args.bert_checkpoint)
-        if not checkpoint.is_dir():
-            parser.error("--bert-checkpoint must be a local fine-tuned model directory")
-        classifier = BertEmailClassifier.from_pretrained(checkpoint)
-        if not hasattr(classifier.model.config, "email_threshold"):
-            parser.error("Checkpoint has no validation-selected email threshold; train it first")
-        score = float(classifier.predict_emails([raw])[0, 1])
-        result["semantic"] = {
-            "positive_score": score, "threshold": classifier.decision_threshold_,
-            "label": classifier.model.config.id2label[int(score >= classifier.decision_threshold_)],
-            "attachment_malware_verdict": "not_assessed_by_BERT"}
+    result = {"attachments": inspect_email_attachments(raw), "attachment_rules": assess_attachment_rules(raw)}
     print(json.dumps(result, ensure_ascii=True, indent=2))
