@@ -22,6 +22,12 @@ from specialists import prepare_specialists, train_specialists, run_specialists,
 from train import load_training_emails, select_label_scope, prepare_data
 
 
+def visible_text(raw):
+    # Subject + visible body after deobfuscation and placeholder masking (source of Doc2Vec text).
+    from preprocess import _deobfuscated_message_text, _parse_email
+    return _deobfuscated_message_text(_parse_email(raw))[0]
+
+
 def email_bytes(index, positive=False):
     msg = EmailMessage()
     msg['Subject'] = f'Notice {index}'
@@ -117,7 +123,7 @@ class PipelineTests(unittest.TestCase):
         with PreprocessingCache(self.root / 'other-cache', workers=2, batch_size=5) as cache:
             parallel = cache.prepare(frame, 'identity', self.root)
             parallel = cache.prepare(parallel, 'features', self.root)
-        for field in ('RecordId', '_features', '_dedup_key', '_semantic_text', '_clean_text', '_html_features',
+        for field in ('RecordId', '_features', '_dedup_key', '_clean_text', '_html_features',
                       '_message_security'):
             self.assertEqual(sequential[field].to_list(), parallel[field].to_list())
         with PreprocessingCache(self.root / 'cache', workers=1) as cache:
@@ -135,6 +141,52 @@ class PipelineTests(unittest.TestCase):
                     cache.prepare(frame, 'identity', self.root)
         errors = pd.read_csv(self.root / 'preprocessing_identity_errors.csv')
         self.assertEqual(set(errors.RecordId), set(frame.RecordId))
+
+    def test_compressed_emails_give_identical_preprocessing_and_workers_fit_memory(self):
+        import pipeline_cache
+        from pipeline_cache import compress_texts, fit_workers
+        frame = training_frame(12)
+        compressed = compress_texts(frame.copy())
+        self.assertTrue(all(isinstance(t, pipeline_cache.CompressedEmail) for t in compressed.Text))
+        self.assertEqual([t.raw() for t in compressed.Text], frame.Text.to_list())
+        store = pipeline_cache.EmailStore(self.root / 'scratch' / 'raw.sqlite')
+        stored = compress_texts(frame.copy(), store)
+        self.assertTrue(all(isinstance(t, pipeline_cache.StoredEmail) for t in stored.Text))
+        self.assertEqual([t.raw() for t in stored.Text], frame.Text.to_list())
+        results = {}
+        for name, data in (('raw', frame), ('compressed', compressed), ('stored', stored)):
+            with PreprocessingCache(self.root / f'cache-{name}', workers=1) as cache:
+                results[name] = cache.prepare(cache.prepare(data, 'identity', self.root), 'features', self.root)
+        for column in ('_dedup_key', '_group_key', '_simhash', '_features', '_clean_text'):
+            self.assertEqual(results['raw'][column].to_list(), results['compressed'][column].to_list(), column)
+            self.assertEqual(results['raw'][column].to_list(), results['stored'][column].to_list(), column)
+        store.close()
+        self.assertFalse((self.root / 'scratch' / 'raw.sqlite').exists())
+        gib = 2 ** 30
+        with patch('pipeline_cache._memory', return_value=(5 * gib, 7 * gib)):
+            self.assertEqual(fit_workers(4), 2)  # (7 - 5 - 1 GB reserve) / 0.35 GB per worker
+        with patch('pipeline_cache._memory', return_value=(1 * gib, 7 * gib)):
+            self.assertEqual(fit_workers(4), 4)
+        with patch('pipeline_cache._memory', return_value=(6.9 * gib, 7 * gib)):
+            self.assertEqual(fit_workers(4), 1)  # never zero
+        with patch('pipeline_cache._memory', return_value=(None, None)):
+            self.assertEqual(fit_workers(4), 4)  # Windows / no container limit
+
+    def test_precomputed_group_signatures_match_grouping_from_raw_text(self):
+        frame = training_frame(40)
+        # Near duplicates: same long body with one changed word, and an exact body copy.
+        body = ' '.join(f'word{i}' for i in range(60))
+        for index, text in enumerate((body, body.replace('word30', 'changed'), body)):
+            msg = EmailMessage(); msg['Subject'] = f'Copy {index}'; msg.set_content(text)
+            location = f'near:message:{index}'
+            frame = pd.concat([frame, pd.DataFrame([{**frame.iloc[0].to_dict(), 'Text': msg.as_bytes(),
+                               'Location': location, 'RecordId': record_id(location)}])], ignore_index=True)
+        with PreprocessingCache(self.root / 'cache', workers=1) as cache:
+            prepared = cache.prepare(frame, 'identity', self.root)
+        self.assertNotIn('_group_body', prepared)  # bodies are not kept in memory
+        from_raw = group_email_variants(prepared.drop(columns=['_group_key', '_simhash']))
+        self.assertEqual(group_email_variants(prepared), from_raw)
+        self.assertEqual(from_raw[-1], from_raw[-3])  # same body, different subject
 
     def test_shared_attachment_stays_in_one_group_despite_different_bodies(self):
         messages = []
@@ -187,9 +239,8 @@ class PipelineTests(unittest.TestCase):
     def test_specialists_use_only_own_features_and_do_not_invent_malware_labels(self):
         frame = training_frame()
         parts, settings = prepare_specialists(frame, self.root, self.root / 'cache', workers=1)
-        manifest = train_specialists(parts, self.root, preprocessing=settings, train_text=False)
+        manifest = train_specialists(parts, self.root, preprocessing=settings)
         self.assertEqual(manifest['status'], 'partial')
-        self.assertEqual(manifest['branches']['text']['status'], 'ready_to_train')
         self.assertEqual(manifest['branches']['html']['status'], 'awaiting_labels')
         self.assertEqual(manifest['branches']['attachment']['status'], 'awaiting_labels')
         self.assertEqual(manifest['branches']['header']['status'], 'trained')
@@ -202,7 +253,7 @@ class PipelineTests(unittest.TestCase):
         original = pd.read_csv(self.root / 'specialist_evaluation.csv', float_precision='round_trip')
         for column in ('Precision', 'Recall', 'F1-score', 'TN', 'FP', 'FN', 'TP'):
             self.assertTrue(np.allclose(recomputed[column], original[column]))
-        self.assertEqual(len(BRANCHES), 5)
+        self.assertEqual(len(BRANCHES), 4)
         for name in ('header', 'url'):
             with (self.root / f'{name}.pkl').open('rb') as f:
                 import pickle
@@ -228,7 +279,7 @@ class PipelineTests(unittest.TestCase):
         labels['label_basis'] = 'Synthetic test labels; not malware ground truth'
         label_path = self.root / 'fixture_labels.csv'; labels.to_csv(label_path, index=False)
         trained = self.root / 'labelled'; trained.mkdir()
-        full = train_specialists(parts, trained, branch_labels=label_path, preprocessing=settings, train_text=False)
+        full = train_specialists(parts, trained, branch_labels=label_path, preprocessing=settings)
         for name in ('html', 'attachment'):
             self.assertEqual(full['branches'][name]['status'], 'trained')
             observed = pd.read_csv(trained / f'{name}_test_scores.csv').set_index('RecordId').Label
@@ -268,11 +319,11 @@ class PipelineTests(unittest.TestCase):
 
         stage2 = self.root / 'stage2'; stage2.mkdir()
         parts, settings = prepare_specialists(frame, stage2, self.root / 'cache', workers=1, target_mode='phishing_vs_spam')
-        manifest = train_specialists(parts, stage2, preprocessing=settings, train_text=False, target_mode='phishing_vs_spam')
+        manifest = train_specialists(parts, stage2, preprocessing=settings, target_mode='phishing_vs_spam')
         self.assertEqual((manifest['target_mode'], manifest['branches']['header']['status']), ('phishing_vs_spam', 'trained'))
         stage1 = self.root / 'stage1'; stage1.mkdir()
         parts, settings = prepare_specialists(training_frame(120), stage1, self.root / 'cache', workers=1, target_mode='broad')
-        train_specialists(parts, stage1, preprocessing=settings, train_text=False, target_mode='broad')
+        train_specialists(parts, stage1, preprocessing=settings, target_mode='broad')
         with self.assertRaises(ValueError):  # stages swapped
             TwoStageFilter(stage2, stage1)
         result = TwoStageFilter(stage1, stage2).assess(email_bytes(1001, True))
@@ -290,17 +341,46 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(two_stage_verdict(flagged, {'phishing_evidence': [], 'branches': {
             'url': {'status': 'no_applicable_input', 'target': 'email_phishing'}}}), 'malicious_unclassified')
 
-    def test_baseline_preparation_still_has_all_rows_and_original_dimensions(self):
+    def test_baseline_preparation_has_all_rows_and_baseline_feature_dimensions(self):
         frame = training_frame(60)
         arrays, _, _, settings = prepare_data(frame, self.root, epochs=2,
             cache_dir=self.root / 'cache', workers=1)
         self.assertEqual(sum(len(y) for _, y in arrays.values()), len(frame))
+        from preprocess import BASELINE_FEATURE_NAMES, FEATURE_NAMES, baseline_feature_vector, extract_baseline_features
+        from pipeline_cache import _process
+        self.assertEqual(len(BASELINE_FEATURE_NAMES), len(FEATURE_NAMES) + 59)  # 53 + 21 header, 14 link, 11 attachment, 13 HTML
+        self.assertEqual(settings['feature_names'], BASELINE_FEATURE_NAMES)
         for X, y in arrays.values():
-            self.assertEqual(X.shape, (len(y), 153))
+            self.assertEqual(X.shape, (len(y), 100 + len(BASELINE_FEATURE_NAMES)))
             self.assertTrue(np.isfinite(X).all())
+        # Training (from the cache) and a web demo (one raw email) build the same vector.
+        raw = email_bytes(7, True)
+        self.assertEqual(baseline_feature_vector(_process((raw, 'features', False))), extract_baseline_features(raw))
+
+    def test_features_extracted_in_one_place_train_elsewhere_without_pickle(self):
+        from sklearn.linear_model import LogisticRegression
+        from train import training
+        from evaluate import evaluate
+        features_dir, model_dir = self.root / 'features', self.root / 'model'
+        exported = training(data=training_frame(80), output_dir=features_dir, features_only=True,
+                            cache_dir=self.root / 'cache', workers=1)
+        self.assertEqual(exported['kind'], 'baseline_features')
+        self.assertFalse((features_dir / 'dumped_models').exists())  # no model in the sandbox stage
+        for name in exported['files']:
+            if name.endswith('.npy'):
+                np.load(features_dir / name, allow_pickle=False)  # plain arrays, nothing to unpickle
+        manifest = training(output_dir=model_dir, from_features=features_dir, epochs=2, run_ablation=False,
+                            candidates={'Logistic Regression': [LogisticRegression(max_iter=500)]})
+        self.assertEqual(manifest['status'], 'complete')
+        self.assertEqual(manifest['settings']['feature_names'], exported['feature_names'])
+        self.assertEqual(len(evaluate(model_dir)), 1)
+        with open(features_dir / 'text_train.jsonl.gz', 'ab') as handle:
+            handle.write(b'tampered')
+        with self.assertRaises(RuntimeError):
+            training(output_dir=self.root / 'model2', from_features=features_dir, epochs=2)
 
     def test_epvme_keeps_envelope_attack_and_separates_it_from_copied_original(self):
-        from preprocess import (extract_message_security_features, prepare_semantic_text,
+        from preprocess import (extract_message_security_features,
                                 _parse_email, _header_attack_identity)
         original = email_bytes(5, True)
         # EPVME stores the attacker's MAIL FROM as a leading "From " line.
@@ -331,7 +411,7 @@ class PipelineTests(unittest.TestCase):
         self.assertNotEqual(compute_dedup_key(spoofed), compute_dedup_key(original))
         self.assertEqual(compute_dedup_key(templated.replace(b'MIME Attack Sample', b'Notice 5')),
                          compute_dedup_key(original))
-        self.assertNotIn('Attack Sample', prepare_semantic_text(templated))
+        self.assertNotIn('Attack Sample', visible_text(templated))
         self.assertNotIn('attack', cleanText(templated).split())
         (self.root / 'scope').mkdir()
         selected = select_label_scope(data, 'phishing', self.root / 'scope', include_synthetic=True)
@@ -340,6 +420,18 @@ class PipelineTests(unittest.TestCase):
             select_label_scope(data, 'phishing', self.root / 'scope', include_synthetic=False)
         summary = json.loads((self.root / 'load' / 'load_summary.json').read_text())
         self.assertEqual(summary['status'], 'complete')
+
+    def test_ingestion_ledger_written_in_scratch_is_moved_into_the_run_folder(self):
+        import os
+        dataset = self.root / 'Dataset'
+        (dataset / 'enron').mkdir(parents=True); (dataset / 'phishing').mkdir()
+        (dataset / 'enron' / 'mail').write_bytes(email_bytes(1))
+        scratch = self.root / 'scratch'
+        with patch.dict(os.environ, {'IAP491_SCRATCH_DIR': str(scratch)}):
+            load_training_emails(self.root / 'load', dataset)
+        self.assertEqual(list(scratch.iterdir()), [])
+        with closing(sqlite3.connect(self.root / 'load' / 'ingestion.sqlite')) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM records WHERE status='loaded'").fetchone()[0], 1)
 
     def test_non_email_files_in_dataset_root_are_recorded_not_loaded(self):
         dataset = self.root / 'Dataset'
@@ -358,7 +450,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(summary['counts']['files_excluded_by_policy'], 1)
 
     def test_phishing_pot_loads_samples_only_and_masks_the_redaction_placeholder(self):
-        from preprocess import prepare_semantic_text, extract_link_features
+        from preprocess import extract_link_features
         dataset = self.root / 'Dataset'
         pot = dataset / 'phishing_pot'
         for folder in ('email', 'img', '.github', '.git/refs/heads', '.git/objects/ab'):
@@ -403,7 +495,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(summary['counts']['files_blocked_by_antivirus'], 1)
         self.assertEqual(summary['counts']['files_excluded_by_policy'], 1)
         self.assertEqual(len(data), 3)  # 2 Phishing Pot samples + 1 Enron; nothing from .git/img/docs
-        semantic = prepare_semantic_text(raw)
+        semantic = visible_text(raw)
         self.assertNotIn('phishing', semantic.lower())
         self.assertIn('Your mailbox is full', semantic)
         self.assertFalse({'phishing', 'pot'} & set(cleanText(raw).split()))
@@ -414,6 +506,65 @@ class PipelineTests(unittest.TestCase):
         with patch('load_data.open', side_effect=OSError(errno.EINVAL, 'Invalid argument'), create=True):
             error = load_data._prefetch_raw(str(pot / 'email' / 'sample-1.eml'), True)[1]
         self.assertEqual(error, 'AntivirusBlocked' if os.name == 'nt' else 'OSError')
+
+    def test_malspam_archives_are_read_in_memory_and_only_eml_members_load(self):
+        import zipfile
+        dataset = self.root / 'Dataset'
+        (dataset / 'malspam' / '2025').mkdir(parents=True)
+        (dataset / 'enron').mkdir(); (dataset / 'phishing').mkdir()
+        (dataset / 'enron' / 'mail').write_bytes(email_bytes(6))
+        lure = EmailMessage(); lure['From'] = 'Orders <orders@example.net>'; lure['To'] = 'buyer@example.org'
+        lure['Subject'] = 'FW: Technical question for order'
+        lure.set_content('Please see the attached order.')
+        lure.add_attachment(b'L\0\0\0\x01\x14\x02\0' + 'powershell -nop'.encode('utf-16le'),
+                            maintype='application', subtype='octet-stream', filename='order.pdf.lnk')
+        archive = dataset / 'malspam' / '2025' / '2025-11-19-email-pushing-malware.eml.zip'
+        with zipfile.ZipFile(archive, 'w') as zf:  # the site's zips are encrypted; zipfile cannot write that
+            zf.writestr('2025-11-19-email-pushing-malware.eml', lure.as_bytes())
+            zf.writestr('payload.exe', b'MZ' + b'\0' * 64)  # never extracted or loaded
+        self.assertEqual(load_data._malspam_passwords(archive.name), [b'infected_20251119', b'infected'])
+        neutral = b'To: recipient@recipient-domain.example'
+        self.assertTrue(load_data._with_recipient(b'From: a@b.example\r\nSubject: x\r\n\r\nbody').startswith(neutral))
+        self.assertIn(neutral + b'\r\nSubject', load_data._with_recipient(b'To: \r\nSubject: x\r\n\r\nbody'))
+        folded = b'To:\r\n\tbob@example.org\r\nSubject: x\r\n\r\nbody'
+        self.assertEqual(load_data._with_recipient(folded), folded)
+        self.assertIn(neutral, load_data._with_recipient(b'To: [information removed]\r\nSubject: x\r\n\r\nb'))
+        kept = b"To: [recipient's email address]\r\nSubject: x\r\n\r\nb"  # preprocess turns it into the address
+        self.assertEqual(load_data._with_recipient(kept), kept)
+        self.assertTrue(load_data._with_recipient(b'From x@y Mon\nSubject: x\n\nb').startswith(b'From x@y Mon\n' + neutral))
+        data = load_training_emails(self.root / 'load', dataset)
+        malspam = data[data.Source == 'malspam']
+        self.assertEqual(len(malspam), 1)
+        self.assertEqual((malspam.LabelKind.iloc[0], malspam.Class.iloc[0]), ('malspam', 1))
+        summary = json.loads((self.root / 'load' / 'load_summary.json').read_text())
+        self.assertEqual(summary['status'], 'complete')
+        self.assertEqual(summary['counts']['malspam_non_email_members_skipped'], 1)
+        (self.root / 'scope').mkdir()
+        selected = select_label_scope(data, 'phishing', self.root / 'scope')
+        self.assertEqual(selected.Class.value_counts().to_dict(), {1: 1, 0: 1})  # malspam is a positive
+        # The site's hand redactions must not become a source fingerprint.
+        from preprocess import extract_link_features, extract_engineered_features, FEATURE_NAMES
+        redacted = (b"From: Orders <orders@example.net>\r\nTo: [recipient's email address]\r\n"
+                    b"Subject: Invoice for [recipient's email domain]\r\n\r\n"
+                    b"Dear [recipient's name], see http://kit.example.top/i.php?n=[recipient's email address] [removed]\r\n")
+        text = visible_text(redacted)
+        for leftover in ('recipient', '[removed]', 'domain.example', 'Dear  ,'):
+            self.assertNotIn(leftover, text)
+        self.assertIn('Invoice for', text)
+        features = dict(zip(FEATURE_NAMES, extract_engineered_features(redacted)))
+        self.assertEqual(features['num_recipients'], 1)  # an address again, as in the original
+        self.assertEqual(extract_link_features(redacted)['link_recipient_address_count'], 1)
+        from preprocess import _parse_email
+        spoofed = (b"From: [spoofed sender name] <[spoofed sender email address]>\r\nTo: a@b.example\r\n"
+                   b"Subject: Order\r\n\r\nFrom [spoofed sender email domain] support. [email chain removed]\r\n")
+        self.assertEqual(_parse_email(spoofed)['From'].strip(), '<sender@sender-domain.example>')
+        self.assertNotIn('sender', visible_text(spoofed).lower())
+        self.assertNotIn('removed', visible_text(spoofed).lower())
+        encoded = EmailMessage(); encoded['From'] = 'a@b.example'; encoded['To'] = 'c@d.example'
+        encoded['Subject'] = 'Payment [subject line information removed]'
+        encoded.set_content('Hi [recipient’s name], invoice from [spoofed sender email domain] attached.',
+                            cte='base64')  # invisible to the raw-byte pass
+        self.assertNotIn('[', visible_text(encoded.as_bytes()))
 
     def test_url_dataset_labels_conflicts_and_shared_lexical_features(self):
         from preprocess import (extract_url_lexical_features, URL_LEXICAL_FEATURE_NAMES,
@@ -456,7 +607,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((counts['mixed_style_word_count'], counts['mixed_script_word_count']), (1, 1))
 
     def test_visible_html_text_drops_hidden_salting_and_joins_split_words(self):
-        from preprocess import extract_visible_html_text, prepare_semantic_text, extract_text_obfuscation_features
+        from preprocess import extract_visible_html_text, extract_text_obfuscation_features
         markup = ('<html><head><style>.pre{display:none}</style></head><body>'
                   '<div class="pre">preheader salt</div>'
                   '<div style="font-size:0">benign meeting agenda</div>'
@@ -471,7 +622,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(stats['font_family_count'], 2)
         msg = EmailMessage(); msg['Subject'] = 'Notice'
         msg.set_content('fallback'); msg.add_alternative(markup, subtype='html')
-        semantic = prepare_semantic_text(msg.as_bytes())
+        semantic = visible_text(msg.as_bytes())
         for hidden in ('salt', 'agenda', 'invisible'):
             self.assertNotIn(hidden, semantic)
         self.assertGreater(extract_text_obfuscation_features(msg.as_bytes())['hidden_text_ratio'], 0.5)
@@ -556,7 +707,55 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(verdict[1] if verdict else None, expected, host)
         clean = EmailMessage(); clean['From'] = 'Bob <bob@example.org>'; clean['To'] = victim
         clean.set_content('Agenda at https://example.org/agenda')
-        self.assertEqual(sum(extract_link_features(clean.as_bytes()).values()), 0)
+        clean_links = extract_link_features(clean.as_bytes())
+        # Host shape describes any link; the warning signals (and the off-site ratio for a
+        # link to the sender's own domain) stay 0.
+        self.assertEqual({k: v for k, v in clean_links.items() if v and not k.startswith('link_max_')}, {})
+
+    def test_domain_layer_uses_public_suffix_list_and_sender_consistency(self):
+        from preprocess import (registrable_domain, domains_look_alike, extract_link_features,
+                                extract_message_security_features, _parse_email)
+        self.assertEqual(registrable_domain('login.secure.example.co.uk'), 'example.co.uk')
+        self.assertEqual(registrable_domain('kit.github.io'), 'kit.github.io')  # PSL private suffix: own site
+        self.assertEqual(registrable_domain('mail.ect.enron'), 'ect.enron')  # unknown suffix: last two labels
+        for a, b, expected in (('globex-supply.com', 'globex-supplies.com', True), ('rnicrosoft.com', 'microsoft.com', True),
+                               ('enron-it.com', 'enron.com', True), ('amazon.de', 'amazon.com', False),
+                               ('apple.com', 'apply.com', False), ('amazonses.com', 'amazon.com', False)):
+            self.assertEqual(domains_look_alike(a, b), expected, (a, b))
+        msg = EmailMessage()
+        msg['From'] = 'Accounts <ap@globex-supply.com>'
+        msg['To'] = 'billing@globex-supplies.com'
+        msg.set_content('Invoice at https://globex-suply.com/pay and https://a1b2-c3d4.example.top/x '
+                        'and https://globex-supply.com/help')
+        raw = msg.as_bytes()
+        links = extract_link_features(raw)
+        self.assertEqual(links['link_sender_lookalike_count'], 1)  # globex-suply.com
+        self.assertAlmostEqual(links['link_offsite_domain_ratio'], 2 / 3)
+        self.assertEqual((links['link_max_host_hyphen_count'], links['link_max_host_digit_count']), (1, 4))
+        self.assertEqual(extract_message_security_features(_parse_email(raw))['hdr_sender_recipient_lookalike'], 1)
+
+    def test_decisive_attachment_rules_fire_alone_and_are_recovered_from_scaled_features(self):
+        from sklearn.preprocessing import StandardScaler
+        from preprocess import (ATTACHMENT_RULES, BASELINE_FEATURE_NAMES, assess_attachment_rules,
+                                extract_baseline_features)
+        from evaluate import attachment_rule_flags
+        self.assertTrue(set(ATTACHMENT_RULES.values()) <= set(BASELINE_FEATURE_NAMES))
+        lnk = b'L\0\0\0\x01\x14\x02\0' + b'\0' * 64 + 'powershell -nop -w hidden'.encode('utf-16le')
+        bad = EmailMessage(); bad['From'] = 'Accounts <a@example.org>'; bad['To'] = 'b@example.org'
+        bad.set_content('Invoice attached.')
+        bad.add_attachment(lnk, maintype='application', subtype='octet-stream', filename='invoice.pdf.lnk')
+        self.assertEqual(set(assess_attachment_rules(bad.as_bytes())), {'double_extension', 'lnk_command'})
+        clean = email_bytes(3)  # carries a harmless .txt attachment
+        self.assertEqual(assess_attachment_rules(clean), [])
+        rows = np.asarray([extract_baseline_features(r) for r in (bad.as_bytes(), clean, email_bytes(4, True))])
+        scaler = StandardScaler().fit(rows)
+        (self.root / 'feature_scaler.pkl').write_bytes(__import__('pickle').dumps(scaler))
+        X = np.hstack([np.zeros((3, 100)), scaler.transform(rows)]).astype(np.float32)
+        manifest = {'settings': {'feature_names': BASELINE_FEATURE_NAMES, 'doc2vec_dim': 100}}
+        flags = attachment_rule_flags(X, manifest, self.root)
+        self.assertEqual(flags.any(axis=1).to_list(), [True, False, False])
+        self.assertTrue(flags.loc[0, 'lnk_command'] and flags.loc[0, 'double_extension'])
+        self.assertIsNone(attachment_rule_flags(X, {'settings': {'feature_names': ['old'], 'doc2vec_dim': 100}}, self.root))
 
     def test_attachment_payload_features_are_static_and_bounded(self):
         import io, zipfile
@@ -599,29 +798,6 @@ class PipelineTests(unittest.TestCase):
             macro = extract_attachment_payload_features(doc.as_bytes())
         self.assertEqual((macro['attachment_vba_autoexec_count'], macro['attachment_vba_suspicious_count'],
                           macro['attachment_vba_stomping_count']), (1, 3, 1))
-
-    def test_local_tiny_bert_training_and_inference_without_download(self):
-        from transformers import BertConfig, BertForSequenceClassification, BertTokenizerFast
-        import torch
-        torch.set_num_threads(2)
-        checkpoint = self.root / 'tiny_initial'; checkpoint.mkdir()
-        vocab = ['[PAD]', '[UNK]', '[CLS]', '[SEP]', '[MASK]', 'message', 'notice',
-                 'identifier', 'please', 'read', 'open', 'https', 'example', 'invalid']
-        (checkpoint / 'vocab.txt').write_text('\n'.join(vocab), encoding='utf-8')
-        tokenizer = BertTokenizerFast(vocab_file=str(checkpoint / 'vocab.txt'), do_lower_case=True)
-        tokenizer.save_pretrained(checkpoint)
-        model = BertForSequenceClassification(BertConfig(vocab_size=len(vocab), hidden_size=16,
-            num_hidden_layers=1, num_attention_heads=2, intermediate_size=32,
-            max_position_embeddings=512, num_labels=2))
-        model.save_pretrained(checkpoint, safe_serialization=True)
-        parts, settings = prepare_specialists(training_frame(40), self.root, self.root / 'cache', workers=1)
-        manifest = train_specialists(parts, self.root, preprocessing=settings,
-            bert_model_name=str(checkpoint), bert_epochs=1)
-        self.assertEqual(manifest['branches']['text']['status'], 'trained')
-        from predict_specialists import EmailSpecialists
-        result = EmailSpecialists(self.root).assess(email_bytes(1001, True))
-        self.assertEqual(result['branches']['text']['status'], 'assessed')
-        self.assertTrue(0 <= result['branches']['text']['score'] <= 1)
 
 
 if __name__ == '__main__':
