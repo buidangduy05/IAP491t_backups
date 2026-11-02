@@ -1,0 +1,13 @@
+{
+  "rows_in": 818508,
+  "dispositions": {
+    "selected": 395201,
+    "duplicate_content": 329138,
+    "outside_label_scope": 93223,
+    "conflicting_labels": 940,
+    "unknown_label_or_missing_content": 6
+  },
+  "rows_selected": 395201,
+  "target_mode": "phishing",
+  "include_synthetic_malicious": true
+}
