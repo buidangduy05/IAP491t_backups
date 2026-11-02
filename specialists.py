@@ -118,7 +118,7 @@ def prepare_specialists(data, output, cache_dir, workers=None, target_mode='phis
     matrix = np.asarray(prepared['_features'].to_list(), dtype=np.float32)
     prepared['_url_available'] = matrix[:, FEATURE_NAMES.index('num_urls')] > 0
     prepared['_attachment_available'] = matrix[:, FEATURE_NAMES.index('num_attachments')] > 0
-    prepared['_html_available'] = matrix[:, FEATURE_NAMES.index('is_html')] > 0
+    prepared['_html_available'] = [bool(item['is_html']) for item in prepared['_html_features']]
     for name, spec in BRANCHES.items():
         if name == 'html':
             vectors = np.fromiter((item[n] for item in prepared['_html_features'] for n in spec['features']),

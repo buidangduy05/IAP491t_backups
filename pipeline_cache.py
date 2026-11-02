@@ -14,7 +14,7 @@ import pandas as pd
 from preprocess import (_parse_email, _get_email_body, _strip_html, _normalize,
                         _english_stopwords, compute_dedup_key, cleanText,
                         remove_stopwords, extract_engineered_features,
-                        extract_html_features, extract_html_security_features,
+                        extract_html_features, extract_html_check_features,
                         extract_message_security_features, extract_text_obfuscation_features,
                         extract_link_features, extract_attachment_payload_features,
                         extract_content_indicators, group_signature)
@@ -22,12 +22,15 @@ from preprocess import (_parse_email, _get_email_body, _strip_html, _normalize,
 
 def preprocessing_signature():
     import bs4
+    import magika
     import tldextract
     # Verb lemmatization needed nltk/WordNet; nltk was removed for an unfixed CVE
     # (2026-10-26). The key stays so manifests keep the same shape.
     settings = {'schema': 1, 'lemmatization': False,
                 'stopwords': sorted(_english_stopwords()), 'bs4': bs4.__version__,
                 'tldextract': tldextract.__version__,
+                # Magika's model ships inside the package: its version fixes the attachment types.
+                'magika': magika.__version__,
                 'pipeline_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 'preprocess_sha256': hashlib.sha256(Path(__file__).with_name('preprocess.py').read_bytes()).hexdigest()}
     return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest(), settings
@@ -48,7 +51,7 @@ def _process(job):
             raise ValueError('Lemmatized runs predate the removal of nltk (2026-10-26); retrain')
         text = remove_stopwords(cleanText(msg))
         return {'_clean_text': text, '_features': extract_engineered_features(msg),
-                '_html_features': {**extract_html_features(markup), **extract_html_security_features(markup)},
+                '_html_features': {**extract_html_features(markup), **extract_html_check_features(markup)},
                 '_message_security': extract_message_security_features(msg),
                 # Evidence only (source-dependent in these corpora); not model inputs.
                 '_text_obfuscation': extract_text_obfuscation_features(msg),

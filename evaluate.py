@@ -98,18 +98,65 @@ def _artifact_problem(path):
 def attachment_rule_flags(X, manifest, model_dir):
     """Per test email, the ATTACHMENT_RULES that fire, recovered from the scaled X columns.
 
-    Returns None for runs whose feature set lacks the rule features (before 2026-10-23).
+    Rules whose feature the run lacks are skipped (obfuscated_script before 2026-11-02);
+    returns None when none is available (runs before 2026-10-23).
     """
     from preprocess import ATTACHMENT_RULES
     names = manifest.get('settings', {}).get('feature_names', [])
-    if not set(ATTACHMENT_RULES.values()) <= set(names):
+    rules = {rule: feature for rule, feature in ATTACHMENT_RULES.items() if feature in names}
+    if not rules:
         return None
     with (model_dir / 'feature_scaler.pkl').open('rb') as handle:
         scaler = pickle.load(handle)
     offset = int(manifest['settings']['doc2vec_dim'])
     values = scaler.inverse_transform(X[:, offset:].astype(np.float64))
-    columns = {rule: values[:, names.index(feature)] > 0.5 for rule, feature in ATTACHMENT_RULES.items()}
+    columns = {rule: values[:, names.index(feature)] > 0.5 for rule, feature in rules.items()}
     return pd.DataFrame(columns)
+
+
+METRIC_PANELS = [('Precision', 'Precision'), ('Recall', 'Recall'), ('F1-score', 'F1-score'),
+                 ('ROC-AUC', 'ROC-AUC'), ('Average-Precision', 'Average precision'),
+                 ('FP', 'False positives (legitimate mail flagged)')]
+
+
+def plot_model_metrics(result, path, plt):
+    """One bar panel per metric, models in the same order (best test F1 on top) in every panel.
+
+    Bars start at zero; the value is printed at each bar's end because the strong models differ
+    only in the third decimal. "+ attachment rules" rows are left out (one bar per classifier).
+    """
+    models = result[~result['Model'].str.endswith(' + attachment rules')]
+    models = models.sort_values(['F1-score', 'Recall'], ascending=False).reset_index(drop=True)
+    selected = (models['Selected-on-validation'].fillna(False).astype(bool).to_numpy()
+                if 'Selected-on-validation' in models else np.zeros(len(models), dtype=bool))
+    colors = np.where(selected, '#2a78d6', '#b4b2ab')
+    y = np.arange(len(models))
+    fig, axes = plt.subplots(2, 3, figsize=(15, 0.42 * len(models) * 2 + 2.4), sharey=True)
+    for ax, (column, title) in zip(axes.flat, METRIC_PANELS):
+        values = models[column].astype(float).to_numpy()
+        count = column == 'FP'
+        top = max(float(np.nanmax(values)), 1.0) if count else 1.0
+        ax.barh(y, values, height=0.6, color=colors)
+        for i, value in zip(y, values):
+            ax.text(value + top * 0.015, i, f'{value:,.0f}' if count else f'{value:.4f}',
+                    va='center', fontsize=9, color='#52514e')
+        ax.set_xlim(0, top * 1.22)
+        ax.set_title(title, loc='left', fontsize=11, color='#0b0b0b')
+        ax.set_xticks([])
+        ax.tick_params(length=0, labelsize=10, labelcolor='#0b0b0b')
+        for spine in ('top', 'right', 'bottom'):
+            ax.spines[spine].set_visible(False)
+        ax.spines['left'].set_color('#d4d3cd')
+    axes[0, 0].set_yticks(y)
+    axes[0, 0].set_yticklabels(models['Model'])
+    axes[0, 0].invert_yaxis()  # shared: best model on top in every panel
+    note = ('Blue: model selected on validation. ' if selected.any() else '') + \
+        'Each model at its own validation-selected threshold.'
+    fig.suptitle(f'Test metrics of {len(models)} models\n{note}', x=0.01, ha='left',
+                 fontsize=13, color='#0b0b0b')
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, facecolor='white')
+    plt.close(fig)
 
 
 def evaluate(base_dir=BASE_DIR):
@@ -229,6 +276,7 @@ def evaluate(base_dir=BASE_DIR):
     for ax in list(axes.flat)[len(matrices):]:
         ax.set_visible(False)
     fig.tight_layout(); fig.savefig(base / 'confusion-matrix.png'); plt.close(fig)
+    plot_model_metrics(result, base / 'model-metrics.png', plt)
     print(result.to_string(index=False))
     return result
 

@@ -21,7 +21,6 @@ from sklearn.ensemble import (RandomForestClassifier, AdaBoostClassifier, Gradie
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.naive_bayes import GaussianNB
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.neural_network import MLPClassifier
 from xgboost import XGBClassifier
@@ -51,12 +50,12 @@ POSITIVE_LABELS = {'phishing': 'phishing', 'broad': 'phishing/spam/unspecified-p
 INCLUDE_SYNTHETIC_MALICIOUS = True
 MIN_VALIDATION_PRECISION = 0.90  # Target on validation, not a production guarantee.
 BALANCED_MODE = 0  # 1: downsample TRAIN only; validation/test keep their distribution.
-TRAIN_ALL_MODELS = True  # Train all 10 classifiers; tune XGBoost, MLP and Random Forest.
+TRAIN_ALL_MODELS = True  # Train all 9 classifiers; tune XGBoost, MLP and Random Forest.
 RUN_ABLATION = True
 DOC2VEC_DIM = 100
 DOC2VEC_EPOCHS = 40
 INFERENCE_EPOCHS = 30
-# Default pipeline: Doc2Vec + engineered features, 10 classifiers, one selected on
+# Default pipeline: Doc2Vec + engineered features, 9 classifiers, one selected on
 # validation. The specialist mode (--mode specialists) has four tabular branches.
 
 
@@ -346,7 +345,6 @@ def build_candidates(y_train, seed=SEED, all_models=TRAIN_ALL_MODELS):
             'Logistic Regression': [LogisticRegression(max_iter=2000, class_weight='balanced', random_state=seed)],
             'SVM': [SVC(probability=True, class_weight='balanced', random_state=seed)],
             'KNN': [KNeighborsClassifier(n_neighbors=min(5, len(y_train)))],
-            'Naive Bayes': [GaussianNB()],
             'Decision Tree': [DecisionTreeClassifier(min_samples_leaf=5, class_weight='balanced', random_state=seed)],
             'AdaBoost': [AdaBoostClassifier(random_state=seed)],
             'Gradient Boosting': [GradientBoostingClassifier(random_state=seed)]})
@@ -487,7 +485,7 @@ if __name__ == '__main__':
     import argparse
     from datetime import datetime
     from zoneinfo import ZoneInfo
-    parser = argparse.ArgumentParser(description='Audited email pipeline: Doc2Vec + 10 classifiers, one selected '
+    parser = argparse.ArgumentParser(description='Audited email pipeline: Doc2Vec + 9 classifiers, one selected '
                                      'on validation (default), or four specialist branches')
     parser.add_argument('--mode', choices=('specialists', 'baseline'), default='baseline')
     parser.add_argument('--target-mode', choices=TARGET_MODES, default=TARGET_MODE,
