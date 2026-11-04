@@ -3,7 +3,7 @@
   "schema_version": 2,
   "target_mode": "phishing",
   "positive_label": "phishing",
-  "selected_model": "MLP",
+  "selected_model": "XGBoost",
   "models": {
     "XGBoost": {
       "file": "XGBoost.pkl",
