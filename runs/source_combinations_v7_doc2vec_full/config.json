@@ -1,0 +1,90 @@
+{
+  "features": "runs\\features_v7",
+  "families": [
+    "Nazario",
+    "Phishing Pot",
+    "Malspam",
+    "EPVME",
+    "Enron",
+    "SpamAssassin",
+    "TREC 2006",
+    "TREC 2007",
+    "CEAS 2008",
+    "Ling-Spam"
+  ],
+  "sizes": [
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "models": [
+    "XGBoost",
+    "Random Forest",
+    "MLP",
+    "Logistic Regression",
+    "SVM",
+    "KNN",
+    "Decision Tree",
+    "AdaBoost",
+    "Gradient Boosting"
+  ],
+  "doc2vec": "per-combination",
+  "epochs": 40,
+  "train_cap": 5000,
+  "eval_cap": 2000,
+  "bootstrap_draws": 1000,
+  "precision_target": 0.9,
+  "seed": 42,
+  "export": {
+    "seed": 42,
+    "dropped_removed_source_rows": {
+      "train": 0,
+      "validation": 0,
+      "test": 0
+    },
+    "pool_rows": {
+      "train": {
+        "CEAS 2008": 5000,
+        "EPVME": 5000,
+        "Enron": 5000,
+        "Ling-Spam": 1447,
+        "Malspam": 3326,
+        "Nazario": 3098,
+        "Phishing Pot": 5000,
+        "SpamAssassin": 2588,
+        "TREC 2006": 5000,
+        "TREC 2007": 5000
+      },
+      "validation": {
+        "CEAS 2008": 2000,
+        "EPVME": 2000,
+        "Enron": 2000,
+        "Ling-Spam": 472,
+        "Malspam": 1123,
+        "Nazario": 1019,
+        "Phishing Pot": 2000,
+        "SpamAssassin": 909,
+        "TREC 2006": 2000,
+        "TREC 2007": 2000
+      },
+      "test": {
+        "CEAS 2008": 2000,
+        "EPVME": 2000,
+        "Enron": 2000,
+        "Ling-Spam": 482,
+        "Malspam": 1123,
+        "Nazario": 1114,
+        "Phishing Pot": 2000,
+        "SpamAssassin": 860,
+        "TREC 2006": 2000,
+        "TREC 2007": 2000
+      }
+    }
+  }
+}
